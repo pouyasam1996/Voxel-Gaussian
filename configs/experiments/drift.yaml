@@ -1,0 +1,6 @@
+# Errors that add up frame after frame, like a real tracker. The steps are much smaller than
+# random noise: after n frames the error is about sqrt(n) steps.
+noise:
+  mode: drift
+  rot_deg: 0.05
+  trans_m: 0.002
