@@ -2,7 +2,7 @@
 
 Stage 0: only creates the run folder with the merged settings. Fusion is added in Stage 1.
 
-  uv run python scripts/run_fusion.py                                   # configs/base.yaml
+  uv run python scripts/run_fusion.py                                   # yamls/base.yaml
   uv run python scripts/run_fusion.py --experiment no_anchor            # + experiments/no_anchor.yaml
   uv run python scripts/run_fusion.py --set tsdf.voxel=0.02 data.every=10
 """
