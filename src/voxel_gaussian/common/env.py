@@ -1,6 +1,6 @@
 """Machine-specific values, read from environment variables (or a .env file).
 
-Only paths and the device live here. Tuning values belong in configs/, because an
+Only paths and the device live here. Tuning values belong in yamls/, because an
 environment variable that differs between two machines would silently change a run.
 
   VG_DATA_ROOT    folder holding the datasets        (default: data)

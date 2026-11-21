@@ -20,7 +20,7 @@ Data goes under `VG_DATA_ROOT`, e.g. `data/Replica/room0/` (`results/` and `traj
 ## Layout
 
 ```
-configs/
+yamls/
   base.yaml                 every setting; defaults reproduce the gaussian-slam baseline
   datasets/<name>.yaml      facts about a dataset (path, intrinsics, depth scale)
   experiments/<name>.yaml   a few values changed on top of base.yaml
@@ -34,6 +34,8 @@ src/voxel_gaussian/
   eval/          trajectory, geometry and image metrics, reports
 scripts/         thin entry points: read config, call src, save outputs
 ```
+
+**YAML rule:** every project YAML file lives under `yamls/`, nowhere else. The only exceptions are files whose location is fixed by a tool: `.github/workflows/ci.yml` (GitHub Actions) and `.pre-commit-config.yaml` (pre-commit).
 
 **Import rule** (no circular imports): each package imports only from the ones to its right.
 

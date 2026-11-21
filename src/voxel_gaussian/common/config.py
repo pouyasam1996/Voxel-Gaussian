@@ -1,10 +1,10 @@
 """All settings of a run, in three layers, each overriding the one before:
 
-  1. configs/base.yaml                       every setting, defaults = the baseline
-  2. configs/experiments/<name>.yaml         a few changed values   (--experiment <name>)
+  1. yamls/base.yaml                         every setting, defaults = the baseline
+  2. yamls/experiments/<name>.yaml           a few changed values   (--experiment <name>)
   3. command line                            single values           (--set refine.steps=500)
 
-Then configs/datasets/<data.dataset>.yaml is added as cfg.dataset (facts about the data).
+Then yamls/datasets/<data.dataset>.yaml is added as cfg.dataset (facts about the data).
 
 The result is a `Config`: nested dataclasses, so code reads `cfg.tsdf.voxel` instead of
 `cfg["tsdf"]["voxel"]`, and mistakes fail at the start of a run instead of silently:
@@ -26,7 +26,7 @@ import yaml
 from voxel_gaussian.common.env import load_env
 
 # src/voxel_gaussian/common/config.py -> repository root
-CONFIG_DIR = Path(__file__).resolve().parents[3] / "configs"
+CONFIG_DIR = Path(__file__).resolve().parents[3] / "yamls"
 
 
 @dataclass
@@ -133,7 +133,7 @@ class Config:
     refine: RefineConfig
     schedule: ScheduleConfig
     render: RenderConfig
-    dataset: DatasetConfig  # filled from configs/datasets/, not from base.yaml
+    dataset: DatasetConfig  # filled from yamls/datasets/, not from base.yaml
 
 
 # ---------------------------------------------------------------------------- loading
@@ -145,7 +145,7 @@ def read_yaml(path) -> dict:
 
 
 def experiment_path(experiment: str) -> Path:
-    """`no_anchor` -> configs/experiments/no_anchor.yaml; a path to a .yaml file is used as is."""
+    """`no_anchor` -> yamls/experiments/no_anchor.yaml; a path to a .yaml file is used as is."""
     if experiment.endswith((".yaml", ".yml")):
         return Path(experiment)
     return CONFIG_DIR / "experiments" / f"{experiment}.yaml"
@@ -251,7 +251,7 @@ def config_parser(description: str | None = None) -> argparse.ArgumentParser:
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--experiment", default=None, help="configs/experiments/<name>.yaml, or a .yaml path"
+        "--experiment", default=None, help="yamls/experiments/<name>.yaml, or a .yaml path"
     )
     parser.add_argument(
         "--set",
