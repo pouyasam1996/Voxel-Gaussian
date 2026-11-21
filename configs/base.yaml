@@ -1,0 +1,64 @@
+# Every setting of the project. Defaults reproduce the gaussian-slam baseline
+# (scripts/step4_fusion/refuse_rounds.py: 3 rounds x 1000 steps, ATE 3.48 -> 1.65 -> 0.91 cm).
+# Experiments in configs/experiments/ change only a few of these values.
+# Rule: a new setting is added here first; experiment files may not add new keys.
+
+data:
+  dataset: replica_room0   # configs/datasets/<name>.yaml
+  every: 20                # use every n-th frame for training (held-out frames sit halfway between)
+  stride: 4                # training images: keep every n-th pixel (1200x680 -> 300x170)
+  fuse_stride: 2           # depth/colour used for fusion: every n-th pixel
+  limit: null              # stop after this many frames (null = all)
+
+noise:                     # synthetic pose error added to the true poses
+  mode: random             # none, random (independent per frame) or drift (adds up)
+  rot_deg: 1.0             # per frame, degrees (drift: per-frame step)
+  trans_m: 0.02            # per frame, metres
+  seed: 0
+
+tsdf:
+  voxel: 0.05              # voxel size, metres
+  block: 8                 # voxels per block side (8x8x8 blocks)
+  trunc_voxels: 4.0        # truncation band, in voxels (4 x 5 cm = 20 cm)
+  depth_max: 10.0          # ignore depth beyond this, metres
+  min_weight: 1.0          # surface: only voxels seen by more frames than this
+
+icp:                       # snapping each camera onto the fused surface with its depth
+  iters: 5                 # 0 = off
+  max_dist: 0.1            # ignore pairs further apart, metres
+  sample: 4                # use every n-th depth pixel
+  damping: 1.0e-6          # keeps directions without grip from drifting
+  min_pairs: 100           # fewer pairs: leave the camera as it is
+  refuse_after_snap: true  # fuse again with the snapped poses before building Gaussians
+
+gaussians:                 # flat blobs built from the surface, one per surface voxel
+  width: 0.5               # across the surface, in voxels (standard deviation)
+  thickness: 0.1           # along the normal, in voxels
+  opacity: 0.9             # starting opacity
+  sh_degree: 0             # 0 = one colour per blob
+
+refine:                    # joint training of Gaussians and camera corrections
+  steps: 1000              # rendered images per round (0 = no Gaussian training)
+  warmup: 300              # Gaussian-only steps at the start of each round
+  depth_weight: 1.0        # depth L1 (m) against colour L1
+  anchor_weight: 100.0     # penalty for blobs beyond anchor_radius
+  anchor_radius: 1.0       # free movement, in voxels
+  lr_means: 2.0e-4
+  lr_colors: 0.0025
+  lr_opacity: 0.01
+  lr_scales: 0.002
+  lr_quats: 0.001
+  lr_rot: 0.005            # camera rotation correction, radians
+  lr_trans: 0.005          # camera shift correction, metres
+  lr_pose_final: 0.1       # camera learning rates decay to this share by the last step
+  log_every: 200
+  eval_views: 5
+
+schedule:                  # rounds of fuse -> snap -> re-fuse -> Gaussians -> refine
+  rounds: 3
+  stop_deg: 0.01           # stop early: mean camera rotation change between rounds
+  stop_mm: 0.5             # stop early: mean camera position change between rounds
+
+render:
+  budget_mb: 512           # memory budget of the tiled renderer
+  background: [0.0, 0.0, 0.0]
