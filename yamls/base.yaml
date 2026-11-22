@@ -1,10 +1,28 @@
 # Every setting of the project. Defaults reproduce the gaussian-slam baseline
 # (scripts/step4_fusion/refuse_rounds.py: 3 rounds x 1000 steps, ATE 3.48 -> 1.65 -> 0.91 cm).
-# Experiments in configs/experiments/ change only a few of these values.
+# Experiments in yamls/experiments/ change only a few of these values.
 # Rule: a new setting is added here first; experiment files may not add new keys.
 
+slam:                      # camera poses from scratch (scripts/run_odometry.py)
+  methods: [dense, orb]    # odometry baselines to run: dense (Open3D), orb (OpenCV)
+  max_width: 640           # shrink images (keep every n-th pixel) to at most this width
+  frame_step: 1            # use every n-th frame (tracking needs small motions: keep 1)
+  max_frames: null         # stop after this many frames (null = all)
+  depth_max: 4.0           # ignore depth beyond this, metres (real sensors get noisy)
+  dense:                   # Open3D dense RGB-D alignment (legacy pipeline: runs on any CPU)
+    method: hybrid         # hybrid (depth + brightness) or intensity (brightness only)
+    iterations: [10, 5, 3] # Gauss-Newton steps per pyramid level, coarse -> fine
+    depth_outlier_trunc: 0.07    # ignore pixel pairs with a larger depth gap, metres
+  orb:                     # ORB feature odometry; feature settings as in ORB-SLAM3's TUM files
+    features: 1000
+    scale_factor: 1.2      # size ratio between pyramid levels
+    levels: 8
+    ratio: 0.7             # keep a match if best distance < ratio x second best
+    ransac_px: 3.0         # a 2D-3D match agrees with a pose within this many pixels
+    min_inliers: 20        # fewer: tracking failed for this frame
+
 data:
-  dataset: replica_room0   # configs/datasets/<name>.yaml
+  dataset: replica_room0   # yamls/datasets/<name>.yaml
   every: 20                # use every n-th frame for training (held-out frames sit halfway between)
   stride: 4                # training images: keep every n-th pixel (1200x680 -> 300x170)
   fuse_stride: 2           # depth/colour used for fusion: every n-th pixel
