@@ -1,4 +1,4 @@
-"""Keyframe tracker (SLAM step 2): ORB on every frame; dense + bundle adjustment per keyframe.
+"""Keyframe tracker: ORB on every frame; dense link, voxel map and bundle adjustment per keyframe.
 
 Every frame (cheap, ~5 ms):
   1. Predict the pose: the camera repeats its last motion (constant velocity).
@@ -18,7 +18,7 @@ Every frame (cheap, ~5 ms):
 Every keyframe (expensive, ~200 ms):
   - dense alignment with the previous keyframe (more iterations): a precise motion, which sets
     the new keyframe's pose, plus its 6x6 information matrix for bundle adjustment;
-  - map points: features matched during tracking reuse their point; more are found among the
+  - map points: features matched during tracking keep their point; more are found among the
     neighbouring keyframes (descriptor match + must project within `fuse_px`); the remaining
     features with depth become new points;
   - alignment to the settled voxel map (mapper.py, tsdf_icp.py), a link in bundle adjustment;
@@ -29,6 +29,8 @@ Poses: frame pose = its keyframe's pose @ T_kc, so moving a keyframe moves its f
 """
 
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -39,7 +41,6 @@ from voxel_gaussian.slam.dense_odometry import DenseOdometry
 from voxel_gaussian.slam.features import (
     Features,
     OrbExtractor,
-    hamming,
     match,
     pose_change,
     refine_pose_with_depth,
@@ -84,12 +85,18 @@ class Tracker:
         self.kf: Keyframe | None = None  # current reference keyframe
         self.last: Candidate | None = None  # last well-tracked frame
         self.velocity = np.eye(4)  # last frame-to-frame motion (camera frame)
-        self.ba_stats: list[dict] = []
-        self.kf_ms: list[float] = []
-        self.dense_links = [0, 0]  # succeeded, failed
         self.good_T: np.ndarray | None = None  # pose of the last successfully tracked frame
         self.lost_streak = 0
-        self.reuse = {"tried": 0, "accepted": 0, "merged": 0, "correction_cm": []}
+        self.ba_stats: list[dict] = []  # one entry per bundle adjustment
+        self.dense_links = [0, 0]  # keyframe-to-keyframe dense alignments: accepted, rejected
+        self.timing: dict[str, list[float]] = defaultdict(list)  # stage -> ms per call
+
+    @contextmanager
+    def timed(self, stage: str):
+        """Add the time spent inside the `with` block to timing[stage] (ms)."""
+        t0 = time.perf_counter()
+        yield
+        self.timing[stage].append((time.perf_counter() - t0) * 1000)
 
     # ------------------------------------------------------------------ results
 
@@ -105,7 +112,8 @@ class Tracker:
 
     def process(self, color: np.ndarray, depth: np.ndarray) -> str:
         k = len(self.frames)
-        feats = self.extract(color, depth)
+        with self.timed("frame: features"):
+            feats = self.extract(color, depth)
         if self.kf is None:
             self._new_keyframe(Candidate(k, np.eye(4), feats, color, depth, []))
             self._record(np.eye(4), "init")
@@ -113,7 +121,8 @@ class Tracker:
 
         prev_pose = self._pose(k - 1)
         pred = prev_pose @ self.velocity
-        T_wc, pairs, inliers = self._track_pnp(self.kf, feats, pred)
+        with self.timed("frame: pose"):
+            T_wc, pairs, inliers = self._track_pnp(self.kf, feats, pred)
         status = "pnp"
         if T_wc is None:
             T_wc, status = self._track_dense(color, depth, pred), "dense"
@@ -143,7 +152,7 @@ class Tracker:
         self._record(T_wc, status)
         if self._needs_keyframe(cand, status, inliers):
             self._promote(cand)
-            # the keyframe's pose may have moved (dense link, map reuse, bundle adjustment):
+            # the keyframe's pose may have moved (dense link, map alignment, bundle adjustment):
             # predict the next frame from where it ended up, not from where it was tracked
             self.velocity = np.linalg.inv(self._pose(k - 1)) @ self.kf.T_wc
             self.good_T = self.kf.T_wc
@@ -228,10 +237,34 @@ class Tracker:
     # ------------------------------------------------------------------ per keyframe
 
     def _new_keyframe(self, cand: Candidate) -> None:
-        t0 = time.perf_counter()
+        with self.timed("keyframe: total"):
+            (kf, kept_index), prev = self._make_keyframe(cand), self.kf
+            with self.timed("keyframe: dense link"):
+                if prev is not None:
+                    self._dense_link(prev, kf, cand.T_wc)
+            self.map.keyframes.append(kf)
+            with self.timed("keyframe: map points"):
+                self._add_points(kf, prev, cand.pairs, kept_index)
+            map_links = {}
+            if self.mapper is not None and self.ba is not None and self.cfg.map.icp_links:
+                with self.timed("keyframe: map alignment"):
+                    link = self.mapper.align(kf)  # where the settled surface says kf is
+                if link is not None:
+                    map_links[kf.id] = link
+            self.kf, self.last = kf, None
+            if self.ba is not None and len(self.map.keyframes) > 1:
+                with self.timed("keyframe: bundle adjustment"):
+                    self.ba_stats.append(self.ba.optimize(self.map, kf, map_links))
+            if self.mapper is not None:  # fuse settled keyframes; re-fuse moved ones
+                with self.timed("keyframe: fusion"):
+                    self.mapper.update(self.map, kf.id)
+
+    def _make_keyframe(self, cand: Candidate) -> tuple[Keyframe, np.ndarray]:
+        """The keyframe (features with usable depth only), and for every feature of the frame
+        its index among the kept ones (-1 = dropped)."""
         keep = cand.feats.depth > 0
-        new_index = -np.ones(len(keep), int)
-        new_index[keep] = np.arange(keep.sum())
+        kept_index = -np.ones(len(keep), int)
+        kept_index[keep] = np.arange(keep.sum())
         kf = Keyframe(
             id=len(self.map.keyframes),
             frame=cand.index,
@@ -242,58 +275,44 @@ class Tracker:
             color=cand.color,
             depth=cand.depth,
         )
-        prev = self.kf
-        if prev is not None:  # precise motion from the previous keyframe (dense, more iterations)
-            ok, Z, info = self.dense.align(
-                kf.rgbd, prev.rgbd, np.linalg.inv(prev.T_wc) @ cand.T_wc,
-                self.t.keyframe_dense_iterations,
-            )  # fmt: skip
-            if ok and self._plausible(prev.T_wc @ Z, cand.T_wc):
-                kf.T_wc = prev.T_wc @ Z
-                self.map.links[(prev.id, kf.id)] = (Z, info)
-                self.dense_links[0] += 1
-            else:
-                self.dense_links[1] += 1
-        self.map.keyframes.append(kf)
+        return kf, kept_index
 
-        # Without bundle adjustment nothing reconciles old points with new keyframe poses, so
-        # sharing points would mix two slightly different versions of the world: each keyframe
-        # then keeps only its own points (steps 1-3 need bundle adjustment).
-        revisited = []
+    def _dense_link(self, prev: Keyframe, kf: Keyframe, T_wc: np.ndarray) -> None:
+        """Precise motion from the previous keyframe (dense, more iterations): sets kf's pose
+        and is kept, with its information matrix, as a link for bundle adjustment."""
+        ok, Z, info = self.dense.align(
+            kf.rgbd, prev.rgbd, np.linalg.inv(prev.T_wc) @ T_wc, self.t.keyframe_dense_iterations
+        )
+        if ok and self._plausible(prev.T_wc @ Z, T_wc):
+            kf.T_wc = prev.T_wc @ Z
+            self.map.links[(prev.id, kf.id)] = (Z, info)
+            self.dense_links[0] += 1
+        else:
+            self.dense_links[1] += 1
+
+    def _add_points(
+        self, kf: Keyframe, prev: Keyframe | None, pairs: list, kept_index: np.ndarray
+    ) -> None:
+        """Map points of kf: shared ones first (only with bundle adjustment: without it nothing
+        reconciles old points with new poses, and sharing would mix two slightly different
+        versions of the world), then a new point for every remaining feature."""
         if self.ba is not None:
-            # 1. sightings found while tracking: same points again
-            for f, pid in cand.pairs:
+            # 1. sightings found while tracking: the same points again
+            for f, pid in pairs:
                 point = self.map.points.get(pid)
-                if new_index[f] >= 0 and point is not None and kf.id not in point.obs:
-                    self.map.observe(pid, kf, int(new_index[f]))
+                if kept_index[f] >= 0 and point is not None and kf.id not in point.obs:
+                    self.map.observe(pid, kf, int(kept_index[f]))
             # 2. more shared points from the neighbouring keyframes
             if prev is not None:
                 neighbours = [prev.id] + [i for i, _ in self.map.covisible(prev) if i != kf.id]
                 for i in neighbours[: self.cfg.ba.window]:
                     self._fuse_points(kf, self.map.keyframes[i])
-            # 3. coming back to an area mapped long ago: reuse (and merge into) its points
-            if self.cfg.reuse.enabled:
-                revisited = self._revisit(kf)
-        # 4. every remaining feature with depth becomes a new point
-        for f in np.flatnonzero(kf.point_ids < 0):
-            (u, v), d = kf.feats.xy[f], kf.feats.depth[f]
-            p_cam = self.K.backproject(np.array([u]), np.array([v]), np.array([d]))[0]
-            self.map.add_point(kf.T_wc[:3, :3] @ p_cam + kf.T_wc[:3, 3], kf, int(f))
-
-        # 5. align to the settled voxel map: a pull towards where the surface says kf is
-        map_links = {}
-        if self.mapper is not None and self.ba is not None and self.cfg.map.icp_links:
-            link = self.mapper.align(kf)
-            if link is not None:
-                map_links[kf.id] = link
-
-        self.kf, self.last = kf, None
-        if self.ba is not None and len(self.map.keyframes) > 1:
-            self.ba_stats.append(self.ba.optimize(self.map, kf, revisited, map_links))
-        # 6. fuse keyframes that have settled; re-fuse fused ones that bundle adjustment moved
-        if self.mapper is not None:
-            self.mapper.update(self.map, kf.id)
-        self.kf_ms.append((time.perf_counter() - t0) * 1000)
+        # 3. every remaining feature becomes a new point (all lifted to 3D in one go)
+        free = np.flatnonzero(kf.point_ids < 0)
+        xy, d = kf.feats.xy[free], kf.feats.depth[free]
+        X_w = self.K.backproject(xy[:, 0], xy[:, 1], d) @ kf.T_wc[:3, :3].T + kf.T_wc[:3, 3]
+        for f, X in zip(free.tolist(), X_w, strict=True):
+            self.map.add_point(X, kf, f)
 
     def finish(self) -> None:
         """End of the run: fuse the keyframes that were still being optimized."""
@@ -319,95 +338,3 @@ class Tracker:
             uv = np.array([self.K.fx * x[0], self.K.fy * x[1]]) / x[2] + [self.K.cx, self.K.cy]
             if np.linalg.norm(uv - kf.feats.xy[f]) < self.t.fuse_px:
                 self.map.observe(int(pid), kf, int(f))
-
-    # ------------------------------------------------------------------ map reuse
-
-    def _revisit(self, kf: Keyframe) -> list[int]:
-        """Light loop closure: find old keyframes that should see what kf sees, reuse their points.
-
-        1. Candidates: older keyframes (not among the recent ones, not already sharing points
-           with kf) whose camera is within max_distance and looks within max_angle_deg.
-        2. Match by projection: each old point is projected into kf with kf's current pose and
-           paired with the closest-looking feature within search_px (drift moves it a little).
-        3. Geometric check: solve kf's pose from those old points (RANSAC). Enough inliers and a
-           small correction (a look-alike place elsewhere would need a large one) = accepted.
-        4. Snap kf onto the old map, and merge: a feature that already has a recent point
-           gets that point merged into the old one, so recent keyframes are tied to the old map
-           too. Bundle adjustment then optimizes kf together with the old keyframes.
-        """
-        r = self.cfg.reuse
-        centre, view = kf.T_wc[:3, 3], kf.T_wc[:3, 2]
-        linked = {i for i, _ in self.map.covisible(kf)}
-        candidates = []
-        for old in self.map.keyframes[: max(0, kf.id - r.skip_recent)]:
-            if old.id in linked:
-                continue
-            dist = np.linalg.norm(old.T_wc[:3, 3] - centre)
-            angle = np.degrees(np.arccos(np.clip(old.T_wc[:3, 2] @ view, -1, 1)))
-            if dist < r.max_distance and angle < r.max_angle_deg:
-                candidates.append((dist, old.id))
-        used = []
-        for _, old_id in sorted(candidates)[: r.max_keyframes]:
-            self.reuse["tried"] += 1
-            f_idx, pids = self._match_by_projection(kf, self.map.keyframes[old_id])
-            if len(f_idx) < r.min_inliers:
-                continue
-            X_w = np.array([self.map.points[p].X for p in pids])
-            T_cw, inl = solve_pnp(
-                X_w, kf.feats.xy[f_idx], self.K, self.cfg.orb.ransac_px, r.min_inliers,
-                np.linalg.inv(kf.T_wc),
-            )  # fmt: skip
-            if T_cw is None:
-                continue
-            T_wc = np.linalg.inv(T_cw)
-            dist, angle = pose_change(kf.T_wc, T_wc)
-            if dist > r.max_correction or angle > r.max_correction_deg:
-                continue
-            kf.T_wc = T_wc  # snap onto the old map
-            for f, pid in zip(f_idx[inl].tolist(), pids[inl].tolist(), strict=True):
-                own = int(kf.point_ids[f])
-                if own >= 0:
-                    self.map.merge(pid, own)  # recent duplicate -> the old point
-                    self.reuse["merged"] += 1
-                elif pid in self.map.points and kf.id not in self.map.points[pid].obs:
-                    self.map.observe(pid, kf, f)
-            self.reuse["accepted"] += 1
-            self.reuse["correction_cm"].append(dist * 100)
-            used.append(old_id)
-        return used
-
-    def _match_by_projection(self, kf: Keyframe, old: Keyframe):
-        """(feature indices in kf, point ids) for old's points that project near a feature of kf
-        with a similar descriptor; each feature and each point used at most once."""
-        r = self.cfg.reuse
-        idx = np.flatnonzero(old.point_ids >= 0)
-        pids = old.point_ids[idx]
-        keep = np.array([kf.id not in self.map.points[p].obs for p in pids], bool)
-        idx, pids = idx[keep], pids[keep]
-        if len(idx) == 0 or len(kf.feats.xy) == 0:
-            return np.zeros(0, int), np.zeros(0, int)
-        X = np.array([self.map.points[p].X for p in pids])
-        T_cw = np.linalg.inv(kf.T_wc)
-        Xc = X @ T_cw[:3, :3].T + T_cw[:3, 3]
-        z = np.maximum(Xc[:, 2], 1e-6)
-        uv = np.stack(
-            [self.K.fx * Xc[:, 0] / z + self.K.cx, self.K.fy * Xc[:, 1] / z + self.K.cy], 1
-        )
-        visible = (Xc[:, 2] > 0.1) & (uv[:, 0] >= 0) & (uv[:, 0] < self.K.width)
-        visible &= (uv[:, 1] >= 0) & (uv[:, 1] < self.K.height)
-        idx, pids, uv = idx[visible], pids[visible], uv[visible]
-        if len(idx) == 0:
-            return np.zeros(0, int), np.zeros(0, int)
-        pix = np.linalg.norm(uv[:, None, :] - kf.feats.xy[None, :, :], axis=2)
-        ham = hamming(old.feats.desc[idx], kf.feats.desc)
-        score = np.where((pix < r.search_px) & (ham <= r.max_hamming), ham, np.inf)
-        best = score.argmin(axis=1)
-        best_score = score[np.arange(len(best)), best]
-        taken, f_out, p_out = set(), [], []
-        for i in np.argsort(best_score):  # closest descriptors first
-            if not np.isfinite(best_score[i]) or best[i] in taken:
-                continue
-            taken.add(best[i])
-            f_out.append(int(best[i]))
-            p_out.append(int(pids[i]))
-        return np.array(f_out, int), np.array(p_out, int)

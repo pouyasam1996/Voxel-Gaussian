@@ -11,10 +11,8 @@ and fused again with the new one (TSDFVolume.integrate(remove=True) is exact).
 
 What each keyframe saw. Fusing returns the voxel blocks a keyframe touched; we keep them
 per keyframe and as a reverse index (block -> keyframes). That answers "which old keyframes
-see what this one sees" by lookup; the revisit search will use it.
+see what this one sees" by lookup (for a future revisit search).
 """
-
-import time
 
 import numpy as np
 
@@ -33,20 +31,16 @@ class Mapper:
         self.fused_pose: dict[int, np.ndarray] = {}  # keyframe id -> pose it was fused with
         self.blocks: dict[int, np.ndarray] = {}  # keyframe id -> block codes it touched
         self.block_index: dict[int, list[int]] = {}  # block code -> keyframes that touched it
-        self.stats = {"fused": 0, "refused": 0, "fuse_ms": [], "icp": dict.fromkeys(
-            ["tried", "accepted", "low_overlap", "too_large"], 0
-        )}  # fmt: skip
+        self.stats = {"fused": 0, "refused": 0}
+        self.icp = dict.fromkeys(["tried", "accepted", "low_overlap", "too_large"], 0)
         self.icp_correction_cm: list[float] = []
         self.icp_rms_mm: list[float] = []
 
     # ------------------------------------------------------------------ fusion
 
     def _fuse(self, kf: Keyframe, T_wc: np.ndarray, remove: bool = False) -> np.ndarray:
-        t0 = time.perf_counter()
         color = kf.color.astype(np.float32) / 255.0
-        codes = self.vol.integrate(kf.depth, color, T_wc, self.K, remove=remove)
-        self.stats["fuse_ms"].append((time.perf_counter() - t0) * 1000)
-        return codes
+        return self.vol.integrate(kf.depth, color, T_wc, self.K, remove=remove)
 
     def update(self, mp: Map, newest: int) -> None:
         """After each keyframe: re-fuse settled keyframes that moved, fuse newly settled ones."""
@@ -90,7 +84,7 @@ class Mapper:
         cfg = self.cfg
         if len(self.vol.codes) == 0:
             return None
-        icp = self.stats["icp"]
+        icp = self.icp
         icp["tried"] += 1
         res = align(self.vol, self.scan(kf), kf.T_wc, cfg.icp_iters, cfg.icp_huber, self.min_weight)
         if res is None or res["overlap"] < cfg.icp_min_overlap:

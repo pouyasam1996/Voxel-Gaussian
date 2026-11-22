@@ -2,16 +2,16 @@
 
   1. yamls/base.yaml                         every setting, defaults = the baseline
   2. yamls/experiments/<name>.yaml           a few changed values   (--experiment <name>)
-  3. command line                            single values           (--set refine.steps=500)
+  3. command line                            single values           (--set slam.max_frames=300)
 
 Then yamls/datasets/<data.dataset>.yaml is added as cfg.dataset (facts about the data).
 
 The result is a `Config`: nested dataclasses, so code reads `cfg.tsdf.voxel` instead of
 `cfg["tsdf"]["voxel"]`, and mistakes fail at the start of a run instead of silently:
-  - a key that base.yaml doesn't have (a typo like `anchor_wieght`) -> error
+  - a key that base.yaml doesn't have (a typo like `max_frams`) -> error
   - a key missing from base.yaml that the code expects                 -> error
   - a wrong type (`steps: fast`)                                        -> error
-An integer where a float is expected is fine (`anchor_weight: 0`).
+An integer where a float is expected is fine (`depth_max: 4`).
 
 Adding a setting: add the field to the dataclass below AND the value to base.yaml.
 """
@@ -47,22 +47,6 @@ class DatasetConfig:
 @dataclass
 class DataConfig:
     dataset: str
-    every: int
-    stride: int
-    fuse_stride: int
-    limit: int | None
-
-
-@dataclass
-class NoiseConfig:
-    mode: str
-    rot_deg: float
-    trans_m: float
-    seed: int
-
-    def __post_init__(self):
-        if self.mode not in ("none", "random", "drift"):
-            raise ValueError(f"noise.mode must be none, random or drift, got {self.mode!r}")
 
 
 @dataclass
@@ -72,56 +56,6 @@ class TSDFConfig:
     trunc_voxels: float
     depth_max: float
     min_weight: float
-
-
-@dataclass
-class ICPConfig:
-    iters: int
-    max_dist: float
-    sample: int
-    damping: float
-    min_pairs: int
-    refuse_after_snap: bool
-
-
-@dataclass
-class GaussiansConfig:
-    width: float
-    thickness: float
-    opacity: float
-    sh_degree: int
-
-
-@dataclass
-class RefineConfig:
-    steps: int
-    warmup: int
-    depth_weight: float
-    anchor_weight: float
-    anchor_radius: float  # in voxels
-    lr_means: float
-    lr_colors: float
-    lr_opacity: float
-    lr_scales: float
-    lr_quats: float
-    lr_rot: float
-    lr_trans: float
-    lr_pose_final: float
-    log_every: int
-    eval_views: int
-
-
-@dataclass
-class ScheduleConfig:
-    rounds: int
-    stop_deg: float
-    stop_mm: float
-
-
-@dataclass
-class RenderConfig:
-    budget_mb: float
-    background: list[float]
 
 
 @dataclass
@@ -167,26 +101,13 @@ class LocalBAConfig:
     window: int
     min_shared_points: int
     iterations: int
+    resolve_fraction: float
     baseline: float
     chi2: float
     link_chi2: float
     dense_links: bool
     dense_link_sigma: float
     max_fixed_keyframes: int
-
-
-@dataclass
-class ReuseConfig:
-    enabled: bool
-    skip_recent: int
-    max_distance: float
-    max_angle_deg: float
-    max_keyframes: int
-    search_px: float
-    max_hamming: int
-    min_inliers: int
-    max_correction: float
-    max_correction_deg: float
 
 
 @dataclass
@@ -216,7 +137,6 @@ class SlamConfig:
     orb: OrbOdometryConfig
     tracker: TrackerConfig
     ba: LocalBAConfig
-    reuse: ReuseConfig
     map: MapConfig
 
 
@@ -224,13 +144,7 @@ class SlamConfig:
 class Config:
     slam: SlamConfig
     data: DataConfig
-    noise: NoiseConfig
     tsdf: TSDFConfig
-    icp: ICPConfig
-    gaussians: GaussiansConfig
-    refine: RefineConfig
-    schedule: ScheduleConfig
-    render: RenderConfig
     dataset: DatasetConfig  # filled from yamls/datasets/, not from base.yaml
 
 
@@ -243,14 +157,14 @@ def read_yaml(path) -> dict:
 
 
 def experiment_path(experiment: str) -> Path:
-    """`no_anchor` -> yamls/experiments/no_anchor.yaml; a path to a .yaml file is used as is."""
+    """`tum` -> yamls/experiments/tum.yaml; a path to a .yaml file is used as is."""
     if experiment.endswith((".yaml", ".yml")):
         return Path(experiment)
     return CONFIG_DIR / "experiments" / f"{experiment}.yaml"
 
 
 def parse_overrides(items: list[str]) -> dict:
-    """["refine.steps=500", "icp.iters=0"] -> {"refine": {"steps": 500}, "icp": {"iters": 0}}.
+    """["slam.max_frames=300", "tsdf.voxel=0.02"] -> {"slam": {"max_frames": 300}, "tsdf": {"voxel": 0.02}}.
 
     Values are read as YAML, so 500 is an int, 0.5 a float, true a bool, null None.
     """
@@ -356,7 +270,7 @@ def config_parser(description: str | None = None) -> argparse.ArgumentParser:
         nargs="+",
         default=[],
         metavar="KEY=VALUE",
-        help="override single settings, e.g. --set refine.steps=500 tsdf.voxel=0.02",
+        help="override single settings, e.g. --set slam.max_frames=300 tsdf.voxel=0.02",
     )
     return parser
 

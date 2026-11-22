@@ -114,13 +114,6 @@ def solve_pnp(
     return T, inl
 
 
-def hamming(desc_a: np.ndarray, desc_b: np.ndarray) -> np.ndarray:
-    """(Na, Nb) table of differing bits between every pair of descriptors."""
-    A = np.unpackbits(desc_a, axis=1).astype(np.float32)
-    B = np.unpackbits(desc_b, axis=1).astype(np.float32)
-    return A @ (1 - B).T + (1 - A) @ B.T
-
-
 def refine_pose_with_depth(
     T_cw: np.ndarray,
     X_w: np.ndarray,

@@ -23,7 +23,9 @@ the solver finds the poses and points with the lowest total spring energy:
    priors), and so is keyframe 0. Without anchors the whole window could slide.
 
 Solve (Levenberg-Marquardt = damped Gauss-Newton), drop sightings whose error is above chi2
-(95% limit for 3 numbers: 7.815), solve again, write poses and points back into the map.
+(95% limit for 3 numbers: 7.815) and map links above link_chi2, solve again if that removed
+more than `resolve_fraction` of the sightings, then write poses and points back into the map.
+Points seen by only one keyframe are not optimized (they carry no information on poses).
 """
 
 import time
@@ -90,18 +92,17 @@ class LocalBA:
         info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
         return gtsam.noiseModel.Gaussian.Information(info)
 
-    def optimize(self, mp: Map, kf, include: list[int] = (), map_links: dict | None = None) -> dict:
-        """Optimize kf, the old keyframes in `include` (revisited areas) and kf's most
-        covisible neighbours, up to `window` keyframes in total. `map_links`: keyframe id ->
-        alignment to the voxel map (a pull towards that pose, stiff where the surface pins it)."""
+    def optimize(self, mp: Map, kf, map_links: dict | None = None) -> dict:
+        """Optimize kf and its most covisible neighbours (up to `window` keyframes) with the
+        points they see. `map_links`: keyframe id -> alignment to the voxel map (a pull towards
+        that pose, stiff where the surface pins it)."""
         t0 = time.perf_counter()
         cfg = self.cfg
-        window = [kf.id, *[i for i in include if i != kf.id]]
+        window = [kf.id]
         for i, n in mp.covisible(kf):
             if len(window) >= cfg.window or n < cfg.min_shared_points:
                 break
-            if i not in window:
-                window.append(i)
+            window.append(i)
         pids = sorted({int(p) for i in window for p in mp.keyframes[i].point_ids if p >= 0})
         shared: dict[int, int] = {}  # other keyframes seeing these points: how many each
         for p in pids:
@@ -115,12 +116,17 @@ class LocalBA:
         free = [i for i in window if i not in fixed]
         if not free:
             return {}
+        # Points seen by only one keyframe of the optimization are left out: 3 unknowns fitted
+        # exactly by 3 measurements say nothing about the poses, they only cost time. Those
+        # seen by nobody else ride along with their keyframe afterwards (as the solver would).
+        members = set(window) | set(fixed)
+        seen, pids = pids, self._shared(mp, pids, members)
+        old_T = {i: mp.keyframes[i].T_wc.copy() for i in free}
 
         map_links = {i: m for i, m in (map_links or {}).items() if i in free}
         removed, map_dropped = 0, 0
         for _ in range(2):  # solve, drop outliers, solve again
-            members = sorted(set(window) | set(fixed))
-            graph, values, sightings = self._build(mp, members, fixed, pids)
+            graph, values, sightings = self._build(mp, sorted(members), fixed, pids)
             map_factors = {}
             for i, link in map_links.items():
                 noise = self._map_noise(link)
@@ -138,19 +144,28 @@ class LocalBA:
             for pid, kid in bad:
                 mp.forget(pid, kid)
             removed += len(bad)
-            pids = [p for p in pids if p in mp.points]
+            pids = self._shared(mp, [p for p in pids if p in mp.points], members)
             # a map alignment the rest disagrees with (95% limit for 6 numbers) is dropped
             wrong = [i for i, f in map_factors.items() if 2 * f.error(result) > cfg.link_chi2]
             for i in wrong:
                 del map_links[i]
             map_dropped += len(wrong)
-            if not bad and not wrong:
+            # solve again only if it matters: enough outliers removed, or a map link dropped
+            if len(bad) <= cfg.resolve_fraction * len(sightings) and not wrong:
                 break
 
         for i in free:
             mp.keyframes[i].T_wc = result.atPose3(X(i)).matrix()
         for p in pids:
             mp.points[p].X = np.asarray(result.atPoint3(L(p))).ravel()
+        solved = set(pids)
+        for p in seen:
+            if p in solved or p not in mp.points or len(mp.points[p].obs) != 1:
+                continue
+            (i,) = mp.points[p].obs
+            if i in old_T:  # same place in the camera, new camera pose
+                D = mp.keyframes[i].T_wc @ np.linalg.inv(old_T[i])
+                mp.points[p].X = D[:3, :3] @ mp.points[p].X + D[:3, 3]
         link_chi2 = [2 * f.error(result) for f in self._link_factors]  # ~6 if sigma is right
         return {
             "window": len(free),
@@ -162,6 +177,10 @@ class LocalBA:
             "map_dropped": map_dropped,
             "ms": (time.perf_counter() - t0) * 1000,
         }
+
+    @staticmethod
+    def _shared(mp: Map, pids, members: set[int]) -> list[int]:
+        return [p for p in pids if sum(i in members for i in mp.points[p].obs) >= 2]
 
     def _build(self, mp: Map, kf_ids: list[int], fixed: list[int], pids: list[int]):
         graph, values, sightings = gtsam.NonlinearFactorGraph(), gtsam.Values(), []

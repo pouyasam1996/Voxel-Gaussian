@@ -11,7 +11,7 @@ turn + shift that makes the scan lie on it. Each iteration:
      solved exactly. Turning around the scan's centre (not the world origin, metres away)
      keeps turning and shifting separate. W: Huber weights (gaps beyond `huber` count
      linearly), so a few points on moved objects or wrong surfaces can't drag the scan.
-  4. Apply it to the camera pose.
+  4. Apply it to the camera pose. Stop after `iters` steps, or earlier once steps are tiny.
 
 Returned besides the pose: how much of the scan landed on mapped surface (overlap), the
 leftover gap (rms), and J^T W J, the information matrix (which directions the surface
@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import torch
 
+from voxel_gaussian.common.device import to_device
 from voxel_gaussian.tsdf.lookup import sample
 from voxel_gaussian.tsdf.volume import TSDFVolume
 
@@ -36,28 +37,31 @@ def align(
 ) -> dict | None:
     """Pose of the scan (camera -> world) aligned to the map, plus fit numbers; None if the
     scan hardly touches mapped surface."""
-    Pc = torch.as_tensor(points_cam, dtype=torch.float32, device=vol.device)
+    Pc = to_device(points_cam, vol.device)
     T = T_wc.copy()
-    overlap = None
+    overlap, converged = None, False
     for it in range(iters + 1):
-        R = torch.as_tensor(T[:3, :3], dtype=torch.float32, device=vol.device)
-        t = torch.as_tensor(T[:3, 3], dtype=torch.float32, device=vol.device)
+        R, t = to_device(T[:3, :3], vol.device), to_device(T[:3, 3], vol.device)
         gap, normal, ok = sample(vol, Pc @ R.T + t, min_weight)
         if overlap is None:
             overlap = float(ok.float().mean())
         if int(ok.sum()) < 50:
             return None
-        p = (Pc[ok] @ R.T + t).cpu().double().numpy()
-        n = normal[ok].cpu().double().numpy()
-        r = gap[ok].cpu().double().numpy()
+        # Lookup on the device (float32); the 6x6 system in float64 on the CPU (the Apple GPU
+        # has no float64). One copy back per iteration: points, normals and gaps together.
+        pnr = torch.cat([Pc[ok] @ R.T + t, normal[ok], gap[ok, None]], 1)
+        pnr = pnr.cpu().numpy().astype(np.float64)
+        p, n, r = pnr[:, :3], pnr[:, 3:6], pnr[:, 6]
         c = p.mean(axis=0)
         J = np.hstack([np.cross(p - c, n), n])
         w = np.where(np.abs(r) <= huber, 1.0, huber / np.maximum(np.abs(r), 1e-12))
         H = (J * w[:, None]).T @ J
-        if it == iters:  # last pass only measures the fit at the final pose
+        if it == iters or converged:  # last pass only measures the fit at the final pose
             break
         g = (J * w[:, None]).T @ r
         x = -np.linalg.solve(H + 1e-9 * np.trace(H) * np.eye(6), g)
+        # stop early once steps are tiny (< 0.1 mm and < 0.006 degrees)
+        converged = np.linalg.norm(x[3:]) < 1e-4 and np.linalg.norm(x[:3]) < 1e-4
         dR = cv2.Rodrigues(x[:3])[0]
         T_new = np.eye(4)
         T_new[:3, :3] = dR @ T[:3, :3]

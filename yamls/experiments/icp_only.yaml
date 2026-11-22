@@ -1,5 +1,0 @@
-# Fusion + ICP snapping only, no Gaussians: how far does depth alone get, and how fast?
-refine:
-  steps: 0
-schedule:
-  rounds: 5

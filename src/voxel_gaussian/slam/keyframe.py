@@ -63,20 +63,6 @@ class Map:
         if not p.obs:
             del self.points[pid]
 
-    def merge(self, keep: int, drop: int) -> None:
-        """Two map points turned out to be the same physical point (e.g. seen again when coming
-        back to an area): move drop's sightings to keep and delete drop."""
-        if keep == drop or keep not in self.points or drop not in self.points:
-            return
-        kept, dropped = self.points[keep], self.points.pop(drop)
-        for kf_id, f in dropped.obs.items():
-            kf = self.keyframes[kf_id]
-            if kf_id in kept.obs:  # that keyframe already sees `keep` through another feature
-                kf.point_ids[f] = -1
-            else:
-                kept.obs[kf_id] = f
-                kf.point_ids[f] = keep
-
     def covisible(self, kf: Keyframe) -> list[tuple[int, int]]:
         """Other keyframes sharing map points with kf: (id, shared count), most shared first."""
         counts: dict[int, int] = {}

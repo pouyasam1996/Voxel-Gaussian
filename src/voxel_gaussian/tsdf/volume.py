@@ -29,14 +29,25 @@ import numpy as np
 import torch
 
 from voxel_gaussian.common.camera import Intrinsics
+from voxel_gaussian.common.device import to_device
 
 _OFF = 1 << 20  # shift coordinates to be positive; 21 bits each fit into one int64
+_BASE = 1 << 21
 
 
 def encode(ijk: torch.Tensor) -> torch.Tensor:
-    """(N, 3) integer coordinates -> (N,) int64 codes, one per coordinate."""
+    """(N, 3) integer coordinates -> (N,) int64 codes, one per coordinate.
+    (x * 2^42 + y * 2^21 + z: plain integer arithmetic, which every GPU backend supports.)"""
     x = ijk + _OFF
-    return (x[:, 0] << 42) | (x[:, 1] << 21) | x[:, 2]
+    return (x[:, 0] * _BASE + x[:, 1]) * _BASE + x[:, 2]
+
+
+def decode(codes: torch.Tensor) -> torch.Tensor:
+    """Inverse of `encode`: (N,) codes -> (N, 3) integer coordinates."""
+    z = codes % _BASE
+    y = (codes // _BASE) % _BASE
+    x = codes // (_BASE * _BASE)
+    return torch.stack([x, y, z], -1) - _OFF
 
 
 def find(sorted_codes: torch.Tensor, query: torch.Tensor):
@@ -49,13 +60,10 @@ def find(sorted_codes: torch.Tensor, query: torch.Tensor):
 
 
 def world_to_camera(T_wc: np.ndarray, device) -> tuple[torch.Tensor, torch.Tensor]:
-    """R, t with x_cam = R x_world + t, as float32 tensors."""
+    """R, t with x_cam = R x_world + t, as float32 tensors (computed in float64 on the CPU)."""
     R = T_wc[:3, :3].T
     t = -R @ T_wc[:3, 3]
-    return (
-        torch.as_tensor(R, dtype=torch.float32, device=device),
-        torch.as_tensor(t, dtype=torch.float32, device=device),
-    )
+    return to_device(R, device), to_device(t, device)
 
 
 class TSDFVolume:
@@ -108,7 +116,8 @@ class TSDFVolume:
         p_cam = torch.stack([(u - K.cx) / K.fx * z, (v - K.cy) / K.fy * z, z], -1)
         p_world = (p_cam - t) @ R
         keys = torch.floor(p_world / (self.voxel_size * self.block)).long()
-        return torch.unique(keys, dim=0)
+        # unique rows via their 1-D codes: simpler for the GPU than a row-wise unique
+        return decode(torch.unique(encode(keys)))
 
     def _allocate(self, keys: torch.Tensor) -> torch.Tensor:
         """Create the blocks that don't exist yet; return the row of every key."""
@@ -143,8 +152,8 @@ class TSDFVolume:
         weight -= 1 (a voxel back at weight 0 is empty again). It needs the same images and
         the same pose that were used to add the frame.
         """
-        depth = torch.as_tensor(depth, dtype=torch.float32, device=self.device)
-        color = torch.as_tensor(color, dtype=torch.float32, device=self.device)
+        depth = to_device(depth, self.device)
+        color = to_device(color, self.device)
         R, t = world_to_camera(T_wc, self.device)
         keys = self.touched_blocks(depth, R, t, K)
         idx = self._allocate(keys)
