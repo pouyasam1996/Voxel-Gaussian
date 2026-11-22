@@ -127,6 +127,20 @@ class MapConfig:
 
 
 @dataclass
+class RevisitConfig:
+    enabled: bool
+    skip_recent: int
+    min_overlap: float
+    max_candidates: int
+    min_inliers: int
+    max_correction: float
+    max_correction_deg: float
+    agree: float
+    agree_deg: float
+    confirm: int
+
+
+@dataclass
 class SlamConfig:
     methods: list[str]
     max_width: int
@@ -138,6 +152,7 @@ class SlamConfig:
     tracker: TrackerConfig
     ba: LocalBAConfig
     map: MapConfig
+    revisit: RevisitConfig
 
 
 @dataclass

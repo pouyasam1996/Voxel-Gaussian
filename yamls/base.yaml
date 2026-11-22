@@ -59,6 +59,17 @@ slam:                      # camera poses from scratch (scripts/run_slam.py, run
     icp_max_correction: 0.05   # reject an alignment that moves the keyframe more, m
     icp_max_correction_deg: 3.0
     icp_link_sigma: 0.002  # typical error of one map alignment, m (stiffness scale, to calibrate)
+  revisit:                 # coming back to a mapped area (step 5, slam/revisit.py); needs ba + map
+    enabled: true
+    skip_recent: 20        # keyframes this recent are neighbours, not revisits
+    min_overlap: 0.3       # old keyframe must have touched this share of the blocks seen now
+    max_candidates: 3      # old keyframes checked per new keyframe, most overlap first
+    min_inliers: 30        # matches that must agree on the old-map pose
+    max_correction: 0.2    # a larger correction is a look-alike place, not drift, m
+    max_correction_deg: 5.0
+    agree: 0.03            # two corrections agree within this, m ...
+    agree_deg: 1.5         # ... and this
+    confirm: 3             # consecutive agreeing keyframes before a revisit counts
 
 data:
   dataset: replica_room0   # yamls/datasets/<name>.yaml

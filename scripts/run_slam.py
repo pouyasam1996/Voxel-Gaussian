@@ -6,6 +6,7 @@ Poses are estimated from scratch (frame 0 = identity); the true poses are only u
   uv run python scripts/run_slam.py --set slam.max_frames=300             # quick check
   uv run python scripts/run_slam.py --set slam.ba.enabled=false           # keyframes only
   uv run python scripts/run_slam.py --set slam.map.enabled=false          # without voxel map
+  uv run python scripts/run_slam.py --set slam.revisit.enabled=false      # without revisits
   uv run python scripts/run_slam.py --experiment tum --set data.dataset=tum_fr1_desk
 
 Run folder:
@@ -21,6 +22,7 @@ Cross-check the trajectory with evo:  evo_ape tum gt.txt slam.txt -a
 import math
 import time
 from collections import Counter
+from dataclasses import asdict
 
 import numpy as np
 import yaml
@@ -108,6 +110,11 @@ if ba:
         "link_chi2_mean": float(np.nanmean([b["link_chi2"] for b in ba])),  # ~6 = calibrated
     }
 
+if tracker.revisit is not None:
+    rv = asdict(tracker.revisit.stats)
+    corr = rv.pop("correction_cm")
+    result["revisit"] = {**rv, "correction_cm_median": float(np.median(corr)) if corr else 0.0}
+
 if tracker.mapper is not None:
     mapper, t = tracker.mapper, cfg.tsdf
     pts, cols, normals = extract_points(mapper.vol, t.min_weight)
@@ -169,6 +176,15 @@ for stage, row in timing.items():
     )
 if "ba" in result:
     print("\nbundle adjustment:", {k: round(v, 2) for k, v in result["ba"].items()})
+if "revisit" in result:
+    v = result["revisit"]
+    print(
+        f"revisits: {v['confirmed']} confirmed, {v['linked']} keyframes linked to the old map "
+        f"({v['points']} points, {v['merged']} merged), median correction "
+        f"{v['correction_cm_median']:.2f} cm; checked {v['checked']} keyframes, "
+        f"{v['candidates']} candidates (few matches {v['few_matches']}, too large "
+        f"{v['too_large']}, disagree {v['disagree']}), passed {v['passed']}"
+    )
 if "map" in result:
     m = result["map"]
     print(

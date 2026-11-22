@@ -21,6 +21,8 @@ Every keyframe (expensive, ~200 ms):
   - map points: features matched during tracking keep their point; more are found among the
     neighbouring keyframes (descriptor match + must project within `fuse_px`); the remaining
     features with depth become new points;
+  - revisit (revisit.py): old keyframes that saw the same voxel blocks; once confirmed, the
+    same points are found again and the recent keyframes are pulled onto the old map;
   - alignment to the settled voxel map (mapper.py, tsdf_icp.py), a link in bundle adjustment;
   - local bundle adjustment (local_ba.py), unless switched off (= step 2a, keyframes only);
   - keyframes that left bundle adjustment's window are fused into the voxel map.
@@ -48,6 +50,7 @@ from voxel_gaussian.slam.features import (
 )
 from voxel_gaussian.slam.keyframe import Keyframe, Map
 from voxel_gaussian.slam.mapper import Mapper
+from voxel_gaussian.slam.revisit import Revisit
 
 
 @dataclass
@@ -81,6 +84,11 @@ class Tracker:
 
             self.ba = LocalBA(K, cfg.ba, cfg.orb.scale_factor)
         self.mapper = Mapper(K, tsdf, cfg.map, device) if cfg.map.enabled and tsdf else None
+        self.revisit = None  # needs the voxel map (which keyframe saw which blocks) and BA
+        if cfg.revisit.enabled and self.mapper is not None and self.ba is not None:
+            self.revisit = Revisit(
+                K, cfg.revisit, cfg.orb, cfg.map.settle_after, cfg.ba.min_shared_points
+            )
         self.frames: list[FrameRecord] = []
         self.kf: Keyframe | None = None  # current reference keyframe
         self.last: Candidate | None = None  # last well-tracked frame
@@ -245,6 +253,10 @@ class Tracker:
             self.map.keyframes.append(kf)
             with self.timed("keyframe: map points"):
                 self._add_points(kf, prev, cand.pairs, kept_index)
+            anchors = []
+            if self.revisit is not None:
+                with self.timed("keyframe: revisit"):
+                    anchors = self.revisit(self.map, self.mapper, kf)
             map_links = {}
             if self.mapper is not None and self.ba is not None and self.cfg.map.icp_links:
                 with self.timed("keyframe: map alignment"):
@@ -254,7 +266,7 @@ class Tracker:
             self.kf, self.last = kf, None
             if self.ba is not None and len(self.map.keyframes) > 1:
                 with self.timed("keyframe: bundle adjustment"):
-                    self.ba_stats.append(self.ba.optimize(self.map, kf, map_links))
+                    self.ba_stats.append(self.ba.optimize(self.map, kf, map_links, anchors))
             if self.mapper is not None:  # fuse settled keyframes; re-fuse moved ones
                 with self.timed("keyframe: fusion"):
                     self.mapper.update(self.map, kf.id)

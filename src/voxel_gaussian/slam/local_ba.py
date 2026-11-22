@@ -20,7 +20,9 @@ the solver finds the poses and points with the lowest total spring energy:
    info_gtsam = Ad^T info Ad, with Ad = Z's adjoint (GTSAM's AdjointMap).
 
 3. Anchors: keyframes outside the window that also see these points are held fixed (stiff
-   priors), and so is keyframe 0. Without anchors the whole window could slide.
+   priors), and so is keyframe 0. Without anchors the whole window could slide. After a
+   revisit (revisit.py), the old keyframes seen again are anchors too: the old map is the
+   reference the recent keyframes are pulled onto.
 
 Solve (Levenberg-Marquardt = damped Gauss-Newton), drop sightings whose error is above chi2
 (95% limit for 3 numbers: 7.815) and map links above link_chi2, solve again if that removed
@@ -92,17 +94,19 @@ class LocalBA:
         info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
         return gtsam.noiseModel.Gaussian.Information(info)
 
-    def optimize(self, mp: Map, kf, map_links: dict | None = None) -> dict:
+    def optimize(self, mp: Map, kf, map_links: dict | None = None, anchors=()) -> dict:
         """Optimize kf and its most covisible neighbours (up to `window` keyframes) with the
         points they see. `map_links`: keyframe id -> alignment to the voxel map (a pull towards
-        that pose, stiff where the surface pins it)."""
+        that pose, stiff where the surface pins it). `anchors`: old keyframes to hold fixed."""
         t0 = time.perf_counter()
         cfg = self.cfg
+        anchors = {int(i) for i in anchors} - {kf.id}
         window = [kf.id]
         for i, n in mp.covisible(kf):
             if len(window) >= cfg.window or n < cfg.min_shared_points:
                 break
-            window.append(i)
+            if i not in anchors:
+                window.append(i)
         pids = sorted({int(p) for i in window for p in mp.keyframes[i].point_ids if p >= 0})
         shared: dict[int, int] = {}  # other keyframes seeing these points: how many each
         for p in pids:
@@ -110,7 +114,8 @@ class LocalBA:
                 if i not in window:
                     shared[i] = shared.get(i, 0) + 1
         # anchors: the keyframes outside the window sharing the most points (capped for speed)
-        fixed = sorted(sorted(shared, key=lambda i: -shared[i])[: cfg.max_fixed_keyframes])
+        others = [i for i in sorted(shared, key=lambda i: -shared[i]) if i not in anchors]
+        fixed = sorted(anchors | set(others[: max(0, cfg.max_fixed_keyframes - len(anchors))]))
         if 0 in window or not fixed:  # anchor: keyframe 0, or else the oldest in the window
             fixed.append(0 if 0 in window else min(window))
         free = [i for i in window if i not in fixed]
@@ -170,6 +175,7 @@ class LocalBA:
         return {
             "window": len(free),
             "fixed": len(fixed),
+            "anchors": len(anchors),
             "points": len(pids),
             "removed": removed,
             "link_chi2": float(np.mean(link_chi2)) if link_chi2 else float("nan"),

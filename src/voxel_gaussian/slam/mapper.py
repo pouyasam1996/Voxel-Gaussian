@@ -11,17 +11,18 @@ and fused again with the new one (TSDFVolume.integrate(remove=True) is exact).
 
 What each keyframe saw. Fusing returns the voxel blocks a keyframe touched; we keep them
 per keyframe and as a reverse index (block -> keyframes). That answers "which old keyframes
-see what this one sees" by lookup (for a future revisit search).
+see what this one sees" by lookup (revisit.py).
 """
 
 import numpy as np
 
 from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import MapConfig, TSDFConfig
+from voxel_gaussian.common.device import to_device
 from voxel_gaussian.slam.features import pose_change
 from voxel_gaussian.slam.keyframe import Keyframe, Map
 from voxel_gaussian.slam.tsdf_icp import align
-from voxel_gaussian.tsdf.volume import TSDFVolume
+from voxel_gaussian.tsdf.volume import TSDFVolume, encode, world_to_camera
 
 
 class Mapper:
@@ -50,18 +51,29 @@ class Mapper:
             dist, angle = pose_change(T_old, kf.T_wc)
             if dist > cfg.refuse_translation or angle > cfg.refuse_rotation_deg:
                 self._fuse(kf, T_old, remove=True)
-                self._fuse(kf, kf.T_wc)
+                self._index(i, self._fuse(kf, kf.T_wc))
                 self.fused_pose[i] = kf.T_wc.copy()
                 self.stats["refused"] += 1
         for kf in mp.keyframes[: max(0, newest - cfg.settle_after + 1)]:
             if kf.id in self.fused_pose:
                 continue
-            codes = self._fuse(kf, kf.T_wc)
+            self._index(kf.id, self._fuse(kf, kf.T_wc))
             self.fused_pose[kf.id] = kf.T_wc.copy()
-            self.blocks[kf.id] = codes
-            for code in codes.tolist():
-                self.block_index.setdefault(code, []).append(kf.id)
             self.stats["fused"] += 1
+
+    def _index(self, i: int, codes: np.ndarray) -> None:
+        """Record the blocks keyframe i touched (replacing what it touched before)."""
+        for code in self.blocks.get(i, np.zeros(0, np.int64)).tolist():
+            self.block_index[code].remove(i)
+        self.blocks[i] = codes
+        for code in codes.tolist():
+            self.block_index.setdefault(code, []).append(i)
+
+    def seen_blocks(self, kf: Keyframe) -> np.ndarray:
+        """Codes of the blocks kf's depth touches at its current pose (not fused, just looked up)."""
+        depth = to_device(kf.depth, self.vol.device)
+        R, t = world_to_camera(kf.T_wc, self.vol.device)
+        return encode(self.vol.touched_blocks(depth, R, t, self.K)).cpu().numpy()
 
     def finish(self, mp: Map) -> None:
         """End of the run: everything has settled."""

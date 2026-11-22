@@ -7,4 +7,5 @@ tracker.py    per-frame tracking, fallbacks, keyframe decisions, map building (s
 local_ba.py   local bundle adjustment with GTSAM (step 2)
 mapper.py     voxel map from settled keyframes; re-fusion of moved ones; blocks per keyframe
 tsdf_icp.py   align a depth image to the voxel map (ICP through the lookup)
+revisit.py    coming back to a mapped area: old keyframes by voxel block, same points again (step 5)
 """
