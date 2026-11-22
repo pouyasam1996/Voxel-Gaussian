@@ -114,6 +114,69 @@ def solve_pnp(
     return T, inl
 
 
+def hamming(desc_a: np.ndarray, desc_b: np.ndarray) -> np.ndarray:
+    """(Na, Nb) table of differing bits between every pair of descriptors."""
+    A = np.unpackbits(desc_a, axis=1).astype(np.float32)
+    B = np.unpackbits(desc_b, axis=1).astype(np.float32)
+    return A @ (1 - B).T + (1 - A) @ B.T
+
+
+def refine_pose_with_depth(
+    T_cw: np.ndarray,
+    X_w: np.ndarray,
+    feats: Features,
+    K: Intrinsics,
+    baseline: float,
+    scale: float,
+    chi2: float,
+    iters: int = 5,
+) -> np.ndarray:
+    """Pose-only refinement with the same measurement as bundle adjustment, map points fixed.
+
+    RANSAC's pose only uses pixel positions. Here each matched feature also contributes its
+    depth, as a virtual second camera `baseline` to the right: u_R = u - fx * b / d.
+    Residual per feature: predicted (u, v, u_R) minus measured, in units of its noise
+    1.2^level; Huber at sqrt(chi2). Gauss-Newton on the 6 pose numbers: a small turn w and
+    shift t applied as X_c -> X_c + w x X_c + t, i.e. dX_c = [-[X_c]x | I] (w, t).
+    Features without depth keep only their (u, v) rows.
+    """
+    fx, fy, cx, cy = K.fx, K.fy, K.cx, K.cy
+    fb = fx * baseline
+    has_d = feats.depth > 0
+    meas = np.stack(
+        [feats.xy[:, 0], feats.xy[:, 1], feats.xy[:, 0] - fb / np.where(has_d, feats.depth, 1)], 1
+    )
+    sigma2 = (scale ** feats.octave.astype(float)) ** 2
+    k2 = chi2
+    T = T_cw.copy()
+    for _ in range(iters):
+        Xc = X_w @ T[:3, :3].T + T[:3, 3]
+        x, y, z = Xc.T
+        if np.any(z <= 1e-6):
+            break
+        r = np.stack([fx * x / z + cx, fy * y / z + cy, fx * x / z + cx - fb / z], 1) - meas
+        Jp = np.zeros((len(z), 3, 3))  # d(u, v, u_R) / d X_c
+        Jp[:, 0, 0], Jp[:, 0, 2] = fx / z, -fx * x / z**2
+        Jp[:, 1, 1], Jp[:, 1, 2] = fy / z, -fy * y / z**2
+        Jp[:, 2, 0], Jp[:, 2, 2] = fx / z, -(fx * x - fb) / z**2
+        r[~has_d, 2], Jp[~has_d, 2] = 0.0, 0.0
+        Jx = np.zeros((len(z), 3, 6))  # d X_c / d (w, t)
+        Jx[:, 0, 1], Jx[:, 0, 2], Jx[:, 1, 0] = z, -y, -z
+        Jx[:, 1, 2], Jx[:, 2, 0], Jx[:, 2, 1] = x, y, -x
+        Jx[:, :, 3:] = np.eye(3)
+        J = Jp @ Jx
+        e2 = (r**2).sum(1) / sigma2
+        w = np.where(e2 <= k2, 1.0, np.sqrt(k2 / np.maximum(e2, 1e-12))) / sigma2  # Huber
+        H = np.einsum("n,nij,nik->jk", w, J, J)
+        g = np.einsum("n,nij,ni->j", w, J, r)
+        step = -np.linalg.solve(H + 1e-9 * np.eye(6), g)
+        R = cv2.Rodrigues(step[:3])[0]
+        T = np.vstack([np.hstack([R @ T[:3, :3], (R @ T[:3, 3] + step[3:])[:, None]]), T[3]])
+        if np.linalg.norm(step) < 1e-9:
+            break
+    return T
+
+
 def pose_change(T_a: np.ndarray, T_b: np.ndarray) -> tuple[float, float]:
     """Distance (m) and rotation angle (deg) between two camera -> world poses."""
     D = np.linalg.inv(T_a) @ T_b

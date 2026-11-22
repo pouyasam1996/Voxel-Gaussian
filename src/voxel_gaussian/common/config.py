@@ -156,6 +156,9 @@ class TrackerConfig:
     max_jump_rotation_deg: float
     edge_depth_ratio: float
     fuse_px: float
+    refine_with_depth: bool
+    reloc_max_distance: float
+    reloc_free_after: int
 
 
 @dataclass
@@ -168,6 +171,21 @@ class LocalBAConfig:
     chi2: float
     dense_links: bool
     dense_link_sigma: float
+    max_fixed_keyframes: int
+
+
+@dataclass
+class ReuseConfig:
+    enabled: bool
+    skip_recent: int
+    max_distance: float
+    max_angle_deg: float
+    max_keyframes: int
+    search_px: float
+    max_hamming: int
+    min_inliers: int
+    max_correction: float
+    max_correction_deg: float
 
 
 @dataclass
@@ -181,6 +199,7 @@ class SlamConfig:
     orb: OrbOdometryConfig
     tracker: TrackerConfig
     ba: LocalBAConfig
+    reuse: ReuseConfig
 
 
 @dataclass

@@ -30,6 +30,9 @@ slam:                      # camera poses from scratch (scripts/run_odometry.py)
     max_jump_rotation_deg: 5.0       # ... or turned this much from it
     edge_depth_ratio: 0.05           # drop feature depth if its 3x3 patch spans > 5% (object edges)
     fuse_px: 5.0                     # a neighbour's map point must project this close to a feature
+    refine_with_depth: true          # after RANSAC, refine each frame's pose with pixel + depth
+    reloc_max_distance: 0.5          # relocalized pose must be this close to the last good one, m
+    reloc_free_after: 30             # ... unless lost for this many frames (then anywhere)
   ba:                      # local bundle adjustment at each keyframe (GTSAM)
     enabled: true          # false = keyframes only, no bundle adjustment (step 2a)
     window: 10             # keyframes optimized: the new one + those sharing the most points
@@ -38,7 +41,20 @@ slam:                      # camera poses from scratch (scripts/run_odometry.py)
     baseline: 0.08         # virtual stereo baseline turning depth into a pixel, m (ORB-SLAM3 TUM ~0.077)
     chi2: 7.815            # 95% limit for a 3-number error: above = outlier; Huber at sqrt(chi2)
     dense_links: true      # add keyframe-to-keyframe dense alignments as pose-to-pose springs
-    dense_link_sigma: 0.002  # typical error of one dense keyframe alignment, m (stiffness scale)
+    dense_link_sigma: 0.0007 # typical error of one dense keyframe link, m. Depends on the depth
+                             # sensor: 0.0007 tuned on Replica; TUM in yamls/experiments/tum.yaml
+    max_fixed_keyframes: 20  # anchor keyframes kept (those sharing the most points); speed cap
+  reuse:                   # coming back to mapped areas ("light loop closure"), at each keyframe
+    enabled: true          # only with bundle adjustment on
+    skip_recent: 20        # keyframes this recent are ordinary neighbours, not revisits
+    max_distance: 1.0      # candidate old keyframe: camera centres within this distance, m
+    max_angle_deg: 30.0    # ... and viewing directions within this angle
+    max_keyframes: 3       # check at most this many candidates, closest first
+    search_px: 15.0        # an old point may land this far from its feature (drift), px
+    max_hamming: 50        # descriptor bits allowed to differ (of 256)
+    min_inliers: 30        # geometric check: pose from the old points needs this many inliers
+    max_correction: 0.2    # reject if snapping onto the old map moves the keyframe more, m
+    max_correction_deg: 5.0  # ... or turns it more, degrees
 
 data:
   dataset: replica_room0   # yamls/datasets/<name>.yaml

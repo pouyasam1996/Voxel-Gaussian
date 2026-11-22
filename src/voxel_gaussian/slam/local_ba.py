@@ -69,14 +69,25 @@ class LocalBA:
         info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
         return gtsam.noiseModel.Gaussian.Information(info)
 
-    def optimize(self, mp: Map, kf) -> dict:
+    def optimize(self, mp: Map, kf, include: list[int] = ()) -> dict:
+        """Optimize kf, the old keyframes in `include` (revisited areas) and kf's most
+        covisible neighbours, up to `window` keyframes in total."""
         t0 = time.perf_counter()
         cfg = self.cfg
-        neighbours = [i for i, n in mp.covisible(kf) if n >= cfg.min_shared_points]
-        window = [kf.id, *neighbours[: cfg.window - 1]]
+        window = [kf.id, *[i for i in include if i != kf.id]]
+        for i, n in mp.covisible(kf):
+            if len(window) >= cfg.window or n < cfg.min_shared_points:
+                break
+            if i not in window:
+                window.append(i)
         pids = sorted({int(p) for i in window for p in mp.keyframes[i].point_ids if p >= 0})
-        observers = {i for p in pids for i in mp.points[p].obs}
-        fixed = sorted(observers - set(window))
+        shared: dict[int, int] = {}  # other keyframes seeing these points: how many each
+        for p in pids:
+            for i in mp.points[p].obs:
+                if i not in window:
+                    shared[i] = shared.get(i, 0) + 1
+        # anchors: the keyframes outside the window sharing the most points (capped for speed)
+        fixed = sorted(sorted(shared, key=lambda i: -shared[i])[: cfg.max_fixed_keyframes])
         if 0 in window or not fixed:  # anchor: keyframe 0, or else the oldest in the window
             fixed.append(0 if 0 in window else min(window))
         free = [i for i in window if i not in fixed]
