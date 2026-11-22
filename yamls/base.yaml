@@ -20,6 +20,25 @@ slam:                      # camera poses from scratch (scripts/run_odometry.py)
     ratio: 0.7             # keep a match if best distance < ratio x second best
     ransac_px: 3.0         # a 2D-3D match agrees with a pose within this many pixels
     min_inliers: 20        # fewer: tracking failed for this frame
+  tracker:                 # keyframe tracker (scripts/run_slam.py); also uses orb, dense above
+    keyframe_max_translation: 0.10   # new keyframe after moving this far from the last one, m
+    keyframe_max_rotation_deg: 6.0   # ... or turning this much
+    keyframe_max_frames: 30          # ... or after this many frames (1 s at 30 frames/s)
+    keyframe_min_inlier_ratio: 0.75  # ... or when inliers drop below this share of the first frame's
+    keyframe_dense_iterations: [20, 10, 10]  # keyframe-to-keyframe dense alignment, coarse -> fine
+    max_jump_translation: 0.05       # reject a pose this far from the constant-velocity guess, m
+    max_jump_rotation_deg: 5.0       # ... or turned this much from it
+    edge_depth_ratio: 0.05           # drop feature depth if its 3x3 patch spans > 5% (object edges)
+    fuse_px: 5.0                     # a neighbour's map point must project this close to a feature
+  ba:                      # local bundle adjustment at each keyframe (GTSAM)
+    enabled: true          # false = keyframes only, no bundle adjustment (step 2a)
+    window: 10             # keyframes optimized: the new one + those sharing the most points
+    min_shared_points: 15  # keyframes count as neighbours when sharing at least this many points
+    iterations: 10         # Levenberg-Marquardt iterations per solve (two solves)
+    baseline: 0.08         # virtual stereo baseline turning depth into a pixel, m (ORB-SLAM3 TUM ~0.077)
+    chi2: 7.815            # 95% limit for a 3-number error: above = outlier; Huber at sqrt(chi2)
+    dense_links: true      # add keyframe-to-keyframe dense alignments as pose-to-pose springs
+    dense_link_sigma: 0.002  # typical error of one dense keyframe alignment, m (stiffness scale)
 
 data:
   dataset: replica_room0   # yamls/datasets/<name>.yaml

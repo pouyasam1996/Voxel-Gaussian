@@ -38,9 +38,29 @@ class DenseOdometry:
             o3d.utility.IntVector(cfg.iterations), cfg.depth_outlier_trunc, 0.0, depth_max
         )
         self.depth_max = depth_max
+        self.depth_outlier_trunc = cfg.depth_outlier_trunc
         self.prev = None
 
-    def _rgbd(self, color: np.ndarray, depth: np.ndarray) -> o3d.geometry.RGBDImage:
+    def align(self, source, target, init=None, iterations: list[int] | None = None):
+        """Align two RGB-D images (from rgbd()): source camera's pose in the target's frame.
+
+        Returns (ok, 4x4 motion, 6x6 information matrix). The information matrix says which
+        directions the alignment pinned down: Open3D sums, over all matched pixels, the
+        squared effect of each of the 6 motion numbers on the target point (rotation first,
+        then translation, perturbed in the target camera's frame).
+        """
+        option = self.option
+        if iterations is not None:
+            option = odometry.OdometryOption(
+                o3d.utility.IntVector(iterations), self.depth_outlier_trunc, 0.0, self.depth_max
+            )
+        init = np.eye(4) if init is None else init
+        ok, motion, info = odometry.compute_rgbd_odometry(
+            source, target, self.K, init, self.jacobian, option
+        )
+        return ok, np.asarray(motion), np.asarray(info)
+
+    def rgbd(self, color: np.ndarray, depth: np.ndarray) -> o3d.geometry.RGBDImage:
         # Colour becomes brightness in [0, 1]; depth is already in metres (depth_scale = 1).
         return o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(np.ascontiguousarray(color)),
@@ -52,7 +72,7 @@ class DenseOdometry:
 
     def track(self, color: np.ndarray, depth: np.ndarray):
         """Motion since the previous frame (4x4), or None if alignment failed; plus info."""
-        cur = self._rgbd(color, depth)
+        cur = self.rgbd(color, depth)
         prev, self.prev = self.prev, cur
         if prev is None:
             return np.eye(4), {}
