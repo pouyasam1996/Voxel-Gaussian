@@ -40,6 +40,7 @@ slam:                      # camera poses from scratch (scripts/run_odometry.py)
     iterations: 10         # Levenberg-Marquardt iterations per solve (two solves)
     baseline: 0.08         # virtual stereo baseline turning depth into a pixel, m (ORB-SLAM3 TUM ~0.077)
     chi2: 7.815            # 95% limit for a 3-number error: above = outlier; Huber at sqrt(chi2)
+    link_chi2: 12.59       # 95% limit for a 6-number error: a map alignment above it is dropped
     dense_links: true      # add keyframe-to-keyframe dense alignments as pose-to-pose springs
     dense_link_sigma: 0.0007 # typical error of one dense keyframe link, m. Depends on the depth
                              # sensor: 0.0007 tuned on Replica; TUM in yamls/experiments/tum.yaml
@@ -55,6 +56,19 @@ slam:                      # camera poses from scratch (scripts/run_odometry.py)
     min_inliers: 30        # geometric check: pose from the old points needs this many inliers
     max_correction: 0.2    # reject if snapping onto the old map moves the keyframe more, m
     max_correction_deg: 5.0  # ... or turns it more, degrees
+  map:                     # voxel map built while tracking (TSDF settings: tsdf section below)
+    enabled: true
+    settle_after: 10       # fuse a keyframe once this many newer ones exist (left BA's window)
+    refuse_translation: 0.01   # re-fuse a fused keyframe that BA moved more than this, m
+    refuse_rotation_deg: 0.5   # ... or turned more than this
+    icp_links: true        # align each new keyframe to the settled map: a link in BA
+    icp_points: 2000       # depth points per alignment
+    icp_iters: 10
+    icp_huber: 0.02        # gaps beyond this count linearly, m
+    icp_min_overlap: 0.3   # share of points that must land on mapped surface
+    icp_max_correction: 0.05   # reject an alignment that moves the keyframe more, m
+    icp_max_correction_deg: 3.0
+    icp_link_sigma: 0.002  # typical error of one map alignment, m (stiffness scale, to calibrate)
 
 data:
   dataset: replica_room0   # yamls/datasets/<name>.yaml

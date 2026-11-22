@@ -21,7 +21,9 @@ Every keyframe (expensive, ~200 ms):
   - map points: features matched during tracking reuse their point; more are found among the
     neighbouring keyframes (descriptor match + must project within `fuse_px`); the remaining
     features with depth become new points;
-  - local bundle adjustment (local_ba.py), unless switched off (= step 2a, keyframes only).
+  - alignment to the settled voxel map (mapper.py, tsdf_icp.py), a link in bundle adjustment;
+  - local bundle adjustment (local_ba.py), unless switched off (= step 2a, keyframes only);
+  - keyframes that left bundle adjustment's window are fused into the voxel map.
 
 Poses: frame pose = its keyframe's pose @ T_kc, so moving a keyframe moves its frames.
 """
@@ -32,7 +34,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from voxel_gaussian.common.camera import Intrinsics
-from voxel_gaussian.common.config import SlamConfig
+from voxel_gaussian.common.config import SlamConfig, TSDFConfig
 from voxel_gaussian.slam.dense_odometry import DenseOdometry
 from voxel_gaussian.slam.features import (
     Features,
@@ -44,6 +46,7 @@ from voxel_gaussian.slam.features import (
     solve_pnp,
 )
 from voxel_gaussian.slam.keyframe import Keyframe, Map
+from voxel_gaussian.slam.mapper import Mapper
 
 
 @dataclass
@@ -64,7 +67,9 @@ class Candidate:  # a successfully tracked frame (also the material for a new ke
 
 
 class Tracker:
-    def __init__(self, K: Intrinsics, cfg: SlamConfig):
+    def __init__(
+        self, K: Intrinsics, cfg: SlamConfig, tsdf: TSDFConfig | None = None, device="cpu"
+    ):
         self.K, self.cfg, self.t = K, cfg, cfg.tracker
         self.extract = OrbExtractor(cfg.orb, cfg.depth_max, cfg.tracker.edge_depth_ratio)
         self.dense = DenseOdometry(K, cfg.dense, cfg.depth_max)
@@ -74,6 +79,7 @@ class Tracker:
             from voxel_gaussian.slam.local_ba import LocalBA  # needs gtsam
 
             self.ba = LocalBA(K, cfg.ba, cfg.orb.scale_factor)
+        self.mapper = Mapper(K, tsdf, cfg.map, device) if cfg.map.enabled and tsdf else None
         self.frames: list[FrameRecord] = []
         self.kf: Keyframe | None = None  # current reference keyframe
         self.last: Candidate | None = None  # last well-tracked frame
@@ -233,6 +239,8 @@ class Tracker:
             feats=cand.feats.subset(keep),
             point_ids=-np.ones(int(keep.sum()), int),
             rgbd=self.dense.rgbd(cand.color, cand.depth),
+            color=cand.color,
+            depth=cand.depth,
         )
         prev = self.kf
         if prev is not None:  # precise motion from the previous keyframe (dense, more iterations)
@@ -272,10 +280,25 @@ class Tracker:
             p_cam = self.K.backproject(np.array([u]), np.array([v]), np.array([d]))[0]
             self.map.add_point(kf.T_wc[:3, :3] @ p_cam + kf.T_wc[:3, 3], kf, int(f))
 
+        # 5. align to the settled voxel map: a pull towards where the surface says kf is
+        map_links = {}
+        if self.mapper is not None and self.ba is not None and self.cfg.map.icp_links:
+            link = self.mapper.align(kf)
+            if link is not None:
+                map_links[kf.id] = link
+
         self.kf, self.last = kf, None
         if self.ba is not None and len(self.map.keyframes) > 1:
-            self.ba_stats.append(self.ba.optimize(self.map, kf, revisited))
+            self.ba_stats.append(self.ba.optimize(self.map, kf, revisited, map_links))
+        # 6. fuse keyframes that have settled; re-fuse fused ones that bundle adjustment moved
+        if self.mapper is not None:
+            self.mapper.update(self.map, kf.id)
         self.kf_ms.append((time.perf_counter() - t0) * 1000)
+
+    def finish(self) -> None:
+        """End of the run: fuse the keyframes that were still being optimized."""
+        if self.mapper is not None:
+            self.mapper.finish(self.map)
 
     def _fuse_points(self, kf: Keyframe, other: Keyframe) -> None:
         """Features of kf that match a map point of `other` by descriptor AND project within
