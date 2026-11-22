@@ -1,0 +1,13 @@
+# Facts about the dataset, not tuning values. TUM RGB-D, recorded with a Kinect (640x480, 30 Hz).
+# Intrinsics and distortion: TUM's calibration for freiburg2, as in ORB-SLAM3's RGB-D settings.
+name: tum_fr2_xyz
+loader: tum               # datasets/tum.py
+path: TUM/rgbd_dataset_freiburg2_xyz              # relative to VG_DATA_ROOT
+width: 640
+height: 480
+fx: 520.908620
+fy: 521.007327
+cx: 325.141442
+cy: 249.701764
+depth_scale: 5208.0            # TUM states 5000; 5208 is ORB-SLAM3's measured correction for freiburg2
+distortion: [0.231222, -0.784899, -0.003257, -0.000105, 0.917205]

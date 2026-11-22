@@ -10,3 +10,4 @@ fy: 600.0
 cx: 599.5
 cy: 339.5
 depth_scale: 6553.5       # metres = stored value / depth_scale (0 = no measurement)
+distortion: [0.0, 0.0, 0.0, 0.0, 0.0]   # rendered images: no lens distortion

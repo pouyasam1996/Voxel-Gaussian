@@ -41,6 +41,7 @@ class DatasetConfig:
     cx: float
     cy: float
     depth_scale: float
+    distortion: list[float]  # OpenCV k1, k2, p1, p2, k3; all 0 = images already undistorted
 
 
 @dataclass
@@ -124,7 +125,40 @@ class RenderConfig:
 
 
 @dataclass
+class DenseOdometryConfig:
+    method: str  # hybrid or intensity
+    iterations: list[int]  # per pyramid level, coarse -> fine
+    depth_outlier_trunc: float
+
+    def __post_init__(self):
+        if self.method not in ("hybrid", "intensity"):
+            raise ValueError(f"slam.dense.method: unknown {self.method!r}")
+
+
+@dataclass
+class OrbOdometryConfig:
+    features: int
+    scale_factor: float
+    levels: int
+    ratio: float
+    ransac_px: float
+    min_inliers: int
+
+
+@dataclass
+class SlamConfig:
+    methods: list[str]
+    max_width: int
+    frame_step: int
+    max_frames: int | None
+    depth_max: float
+    dense: DenseOdometryConfig
+    orb: OrbOdometryConfig
+
+
+@dataclass
 class Config:
+    slam: SlamConfig
     data: DataConfig
     noise: NoiseConfig
     tsdf: TSDFConfig

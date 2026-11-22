@@ -1,5 +1,5 @@
 """Data loaders and synthetic pose noise. May import: common.
 
-replica.py, noise.py   (Stage 1)
-tum.py                 (Stage 10, real recorded data)
+sequence.py, replica.py, tum.py   RGB-D frames + true poses (SLAM step 1)
+noise.py                          synthetic pose noise (Stage 1)
 """
