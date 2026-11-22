@@ -146,6 +146,31 @@ class OrbOdometryConfig:
 
 
 @dataclass
+class TrackerConfig:
+    keyframe_max_translation: float
+    keyframe_max_rotation_deg: float
+    keyframe_max_frames: int
+    keyframe_min_inlier_ratio: float
+    keyframe_dense_iterations: list[int]
+    max_jump_translation: float
+    max_jump_rotation_deg: float
+    edge_depth_ratio: float
+    fuse_px: float
+
+
+@dataclass
+class LocalBAConfig:
+    enabled: bool
+    window: int
+    min_shared_points: int
+    iterations: int
+    baseline: float
+    chi2: float
+    dense_links: bool
+    dense_link_sigma: float
+
+
+@dataclass
 class SlamConfig:
     methods: list[str]
     max_width: int
@@ -154,6 +179,8 @@ class SlamConfig:
     depth_max: float
     dense: DenseOdometryConfig
     orb: OrbOdometryConfig
+    tracker: TrackerConfig
+    ba: LocalBAConfig
 
 
 @dataclass
