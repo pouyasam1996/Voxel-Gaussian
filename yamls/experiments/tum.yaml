@@ -1,0 +1,7 @@
+# TUM RGB-D (real Kinect depth): noisier than Replica's rendered depth, so each dense keyframe
+# link is less precise. Starting value from the link check (weighted error ~20 at 0.002 m);
+# tune once on fr1/desk, then keep it fixed for fr2/xyz and fr3/office.
+#   uv run python scripts/run_slam.py --experiment tum --set data.dataset=tum_fr1_desk
+slam:
+  ba:
+    dense_link_sigma: 0.0037

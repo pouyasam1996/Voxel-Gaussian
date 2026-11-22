@@ -5,7 +5,7 @@ Poses are estimated from scratch (frame 0 = identity); true poses are only used 
   uv run python scripts/run_slam.py                                       # Replica room0, with BA
   uv run python scripts/run_slam.py --set slam.ba.enabled=false           # keyframes only (2a)
   uv run python scripts/run_slam.py --set slam.max_frames=300
-  uv run python scripts/run_slam.py --set data.dataset=tum_fr1_desk
+  uv run python scripts/run_slam.py --experiment tum --set data.dataset=tum_fr1_desk
 
 Run folder: gt.txt, slam.txt (every frame), keyframes.txt (TUM format), results.yaml,
 trajectories.png. Compare with step 1 (scripts/run_odometry.py) on the same frames.
@@ -85,6 +85,16 @@ result = {
     "keyframe_ms_median": float(np.median(tracker.kf_ms)),
     "dense_links_ok_failed": list(tracker.dense_links),
 }
+if s.ba.enabled and s.reuse.enabled:  # coming back to mapped areas
+    ru = tracker.reuse
+    result["reuse"] = {
+        "tried": ru["tried"],
+        "accepted": ru["accepted"],
+        "merged_points": ru["merged"],
+        "correction_cm_median": float(np.median(ru["correction_cm"]))
+        if ru["correction_cm"]
+        else 0.0,
+    }
 if ba:
     result["ba"] = {
         "ms_median": float(np.median([b["ms"] for b in ba])),
@@ -107,3 +117,5 @@ print_table(
 print(f"keyframe_ms_median {result['keyframe_ms_median']:.0f}")
 if ba:
     print("bundle adjustment:", result["ba"])
+if "reuse" in result:
+    print("map reuse:", result["reuse"])
