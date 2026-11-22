@@ -64,6 +64,16 @@ Every run gets its own folder, `<VG_OUTPUT_ROOT>/<dataset>/<date-time>_<experime
 - `config.yaml`: the merged settings;
 - `run.yaml`: the command, overrides, git commit and data path.
 
+## Gaussians on the SLAM (Step 1)
+
+`run_slam.py` saves `map.pt` in its run folder: the voxel map and every frame's pose. `run_gaussians.py` starts one flat blob per surface voxel of that map and trains them on the keyframes with the SLAM poses held fixed. Held-out frames (halfway between keyframes, never fused or trained) are drawn from their SLAM poses.
+
+```bash
+uv run python scripts/run_slam.py
+uv run python scripts/run_gaussians.py --set train.slam_run=<SLAM run folder name>
+uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.keyframe_every=2   # half the keyframes
+```
+
 ## Stages
 
 One git branch per stage. A stage ends with its results table in `outputs/`. The next stage starts only when "done when" is met.

@@ -2,5 +2,5 @@
 
 trajectory.py, report.py   ATE, RPE, TUM export, plots (SLAM step 1)
 geometry.py                surface accuracy and completeness
-image.py                   (Stage 2)
+image.py                   PSNR, SSIM, depth error and coverage of rendered views
 """

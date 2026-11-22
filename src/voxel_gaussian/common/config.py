@@ -112,6 +112,14 @@ class RefineConfig:
 
 
 @dataclass
+class TrainConfig:
+    slam_run: str | None  # SLAM run folder holding map.pt (scripts/run_gaussians.py)
+    stride: int  # training images: keep every n-th pixel
+    keyframe_every: int  # train on every n-th keyframe (2 = half of them)
+    max_heldout: int  # held-out frames: halfway between keyframes, at most this many
+
+
+@dataclass
 class ScheduleConfig:
     rounds: int
     stop_deg: float
@@ -229,6 +237,7 @@ class Config:
     icp: ICPConfig
     gaussians: GaussiansConfig
     refine: RefineConfig
+    train: TrainConfig
     schedule: ScheduleConfig
     render: RenderConfig
     dataset: DatasetConfig  # filled from yamls/datasets/, not from base.yaml

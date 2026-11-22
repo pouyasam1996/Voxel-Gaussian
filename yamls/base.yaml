@@ -121,6 +121,13 @@ refine:                    # joint training of Gaussians and camera corrections
   log_every: 200
   eval_views: 5
 
+train:                     # Gaussians on the SLAM's map and poses (scripts/run_gaussians.py)
+  slam_run: null           # SLAM run folder with map.pt: absolute, or relative to
+                           # <VG_OUTPUT_ROOT>/<dataset>/ (e.g. 2026-11-22_150000_base)
+  stride: 4                # training images: keep every n-th pixel (1200x680 -> 300x170)
+  keyframe_every: 1        # train on every n-th keyframe (2 = half of them)
+  max_heldout: 100         # held-out frames, halfway between keyframes (never fused, never trained)
+
 schedule:                  # rounds of fuse -> snap -> re-fuse -> Gaussians -> refine
   rounds: 3
   stop_deg: 0.01           # stop early: mean camera rotation change between rounds

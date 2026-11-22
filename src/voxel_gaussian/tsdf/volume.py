@@ -199,6 +199,26 @@ class TSDFVolume:
             self.color.view(-1, 3)[keep],
         )
 
+    def state(self) -> dict:
+        """Everything needed to rebuild the grid later (run_slam.py saves it, run_gaussians.py
+        reads it). Plain tensors and numbers, so torch.load(weights_only=True) accepts it."""
+        return {
+            "voxel_size": self.voxel_size,
+            "block": self.block,
+            "trunc_voxels": self.trunc / self.voxel_size,
+            "depth_max": self.depth_max,
+            **{k: getattr(self, k).cpu() for k in ("codes", "keys", "tsdf", "weight", "color")},
+        }
+
+    @classmethod
+    def from_state(cls, state: dict, device="cpu") -> "TSDFVolume":
+        vol = cls(
+            state["voxel_size"], state["block"], state["trunc_voxels"], state["depth_max"], device
+        )
+        for k in ("codes", "keys", "tsdf", "weight", "color"):
+            setattr(vol, k, state[k].to(vol.device))
+        return vol
+
     def memory_mb(self) -> float:
         """Storage used by tsdf + weight + colour (5 floats per voxel)."""
         return len(self.codes) * self.block**3 * 5 * 4 / 1e6
