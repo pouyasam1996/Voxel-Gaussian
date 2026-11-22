@@ -8,7 +8,8 @@ Poses are estimated from scratch (frame 0 = identity); true poses are only used 
   uv run python scripts/run_slam.py --experiment tum --set data.dataset=tum_fr1_desk
 
 Run folder: gt.txt, slam.txt (every frame), keyframes.txt (TUM format), results.yaml,
-trajectories.png. Compare with step 1 (scripts/run_odometry.py) on the same frames.
+trajectories.png, surface.ply (our voxel map) and surface_true_poses.ply (the same keyframes
+fused with the true poses; results.yaml compares the two). Compare with step 1 (scripts/run_odometry.py) on the same frames.
 Cross-check with evo:  evo_ape tum gt.txt slam.txt -a
 """
 
@@ -20,12 +21,16 @@ import numpy as np
 import yaml
 
 from voxel_gaussian.common.config import config_from_args, config_parser
+from voxel_gaussian.common.device import get_device
 from voxel_gaussian.common.env import data_root
 from voxel_gaussian.common.run import start_run
 from voxel_gaussian.datasets.sequence import load_sequence
+from voxel_gaussian.eval.geometry import surface_errors
 from voxel_gaussian.eval.report import plot_trajectories, print_table
-from voxel_gaussian.eval.trajectory import ate, path_length_m, rpe, save_tum
+from voxel_gaussian.eval.trajectory import align_rigid, ate, path_length_m, rpe, save_tum
 from voxel_gaussian.slam.tracker import Tracker
+from voxel_gaussian.tsdf.surface import extract_points, save_ply
+from voxel_gaussian.tsdf.volume import TSDFVolume
 
 args = config_parser(__doc__).parse_args()
 cfg = config_from_args(args)
@@ -45,7 +50,8 @@ print(
     f"true path {path_length_m(gt):.2f} m, {name} -> {run_dir}"
 )
 
-tracker = Tracker(K, s)
+device = get_device()
+tracker = Tracker(K, s, cfg.tsdf, device)
 frame_ms = []  # frames that did not create a keyframe
 for k, i in enumerate(frames):
     color, depth = seq.read(i, stride)
@@ -62,6 +68,7 @@ for k, i in enumerate(frames):
             f"{np.median(tracker.kf_ms):.0f} ms/keyframe"
         )
 
+tracker.finish()  # fuse the keyframes still being optimized at the end
 est = tracker.poses()
 kf_frames, kf_poses = tracker.keyframe_poses()
 save_tum(run_dir / "slam.txt", stamps, est)
@@ -105,6 +112,36 @@ if ba:
         "link_chi2_mean": float(np.nanmean([b["link_chi2"] for b in ba])),
     }
 
+if tracker.mapper is not None:
+    mapper, t = tracker.mapper, cfg.tsdf
+    pts, cols, normals = extract_points(mapper.vol, t.min_weight)
+    save_ply(run_dir / "surface.ply", pts, cols, normals)
+    # Reference: the same keyframe images fused with their TRUE poses. Comparing with it
+    # measures only what pose errors do to the surface (same images, same voxel size).
+    ref = TSDFVolume(t.voxel, t.block, t.trunc_voxels, t.depth_max, device)
+    for kf in tracker.map.keyframes:
+        ref.integrate(kf.depth, kf.color.astype(np.float32) / 255.0, gt[kf.frame], K)
+    ref_pts, ref_cols, ref_normals = extract_points(ref, t.min_weight)
+    save_ply(run_dir / "surface_true_poses.ply", ref_pts, ref_cols, ref_normals)
+    # our map is in SLAM's frame (frame 0 = origin): move it like the ATE alignment does
+    R, shift = align_rigid(kf_poses[:, :3, 3], gt[kf_frames][:, :3, 3])
+    surface = surface_errors(pts.cpu().numpy() @ R.T + shift, ref_pts.cpu().numpy())
+    icp = mapper.stats["icp"]
+    result["map"] = {
+        **surface,
+        "memory_mb": mapper.vol.memory_mb(),
+        "fused": mapper.stats["fused"],
+        "refused_after_move": mapper.stats["refused"],
+        "fuse_ms_median": float(np.median(mapper.stats["fuse_ms"])),
+        "icp_tried": icp["tried"],
+        "icp_accepted": icp["accepted"],
+        "icp_low_overlap": icp["low_overlap"],
+        "icp_too_large": icp["too_large"],
+        "icp_dropped_by_ba": int(sum(b.get("map_dropped", 0) for b in ba)),
+        "icp_correction_cm_median": float(np.median(mapper.icp_correction_cm or [0.0])),
+        "icp_rms_mm_median": float(np.median(mapper.icp_rms_mm or [0.0])),
+    }
+
 with open(run_dir / "results.yaml", "w") as f:
     yaml.safe_dump({name: result}, f, sort_keys=False)
 plot_trajectories(
@@ -119,3 +156,8 @@ if ba:
     print("bundle adjustment:", result["ba"])
 if "reuse" in result:
     print("map reuse:", result["reuse"])
+if "map" in result:
+    print(
+        "voxel map:",
+        {k: round(v, 3) if isinstance(v, float) else v for k, v in result["map"].items()},
+    )

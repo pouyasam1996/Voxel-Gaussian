@@ -69,9 +69,31 @@ class LocalBA:
         info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
         return gtsam.noiseModel.Gaussian.Information(info)
 
-    def optimize(self, mp: Map, kf, include: list[int] = ()) -> dict:
+    def _map_noise(self, link: dict):
+        """Alignment to the voxel map -> GTSAM noise model for a pose prior.
+
+        The ICP information is for a turn around the scan's centre c then a shift, in world
+        axes; GTSAM's prior error is a turn + shift in the camera's own axes. Changing the
+        pivot from c to the origin: shift_c = shift_0 - c x turn, i.e. A1 = [[I, 0], [-[c]x, I]];
+        world axes -> camera axes: the pose's adjoint. info_gtsam = A^T info A, A = A1 Ad.
+        Rescaled like the dense links: shape from ICP, overall stiffness from `sigma`.
+        """
+        info, c, sigma = link["info"], link["pivot"], link["sigma"]
+        n = np.mean(np.diag(info)[3:])
+        if n <= 0:
+            return None
+        info = info / (n * sigma**2)
+        A1 = np.eye(6)
+        A1[3:, :3] = -np.array([[0, -c[2], c[1]], [c[2], 0, -c[0]], [-c[1], c[0], 0]])
+        A = A1 @ gtsam.Pose3(link["T"]).AdjointMap()
+        info = A.T @ info @ A
+        info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
+        return gtsam.noiseModel.Gaussian.Information(info)
+
+    def optimize(self, mp: Map, kf, include: list[int] = (), map_links: dict | None = None) -> dict:
         """Optimize kf, the old keyframes in `include` (revisited areas) and kf's most
-        covisible neighbours, up to `window` keyframes in total."""
+        covisible neighbours, up to `window` keyframes in total. `map_links`: keyframe id ->
+        alignment to the voxel map (a pull towards that pose, stiff where the surface pins it)."""
         t0 = time.perf_counter()
         cfg = self.cfg
         window = [kf.id, *[i for i in include if i != kf.id]]
@@ -94,10 +116,17 @@ class LocalBA:
         if not free:
             return {}
 
-        removed = 0
-        for _ in range(2):  # solve, drop outlier sightings, solve again
+        map_links = {i: m for i, m in (map_links or {}).items() if i in free}
+        removed, map_dropped = 0, 0
+        for _ in range(2):  # solve, drop outliers, solve again
             members = sorted(set(window) | set(fixed))
             graph, values, sightings = self._build(mp, members, fixed, pids)
+            map_factors = {}
+            for i, link in map_links.items():
+                noise = self._map_noise(link)
+                if noise is not None:
+                    map_factors[i] = gtsam.PriorFactorPose3(X(i), gtsam.Pose3(link["T"]), noise)
+                    graph.add(map_factors[i])
             params = gtsam.LevenbergMarquardtParams()
             params.setMaxIterations(cfg.iterations)
             result = gtsam.LevenbergMarquardtOptimizer(graph, values, params).optimize()
@@ -110,7 +139,12 @@ class LocalBA:
                 mp.forget(pid, kid)
             removed += len(bad)
             pids = [p for p in pids if p in mp.points]
-            if not bad:
+            # a map alignment the rest disagrees with (95% limit for 6 numbers) is dropped
+            wrong = [i for i, f in map_factors.items() if 2 * f.error(result) > cfg.link_chi2]
+            for i in wrong:
+                del map_links[i]
+            map_dropped += len(wrong)
+            if not bad and not wrong:
                 break
 
         for i in free:
@@ -124,6 +158,8 @@ class LocalBA:
             "points": len(pids),
             "removed": removed,
             "link_chi2": float(np.mean(link_chi2)) if link_chi2 else float("nan"),
+            "map_links": len(map_links),
+            "map_dropped": map_dropped,
             "ms": (time.perf_counter() - t0) * 1000,
         }
 

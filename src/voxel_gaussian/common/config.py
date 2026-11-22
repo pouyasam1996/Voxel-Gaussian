@@ -169,6 +169,7 @@ class LocalBAConfig:
     iterations: int
     baseline: float
     chi2: float
+    link_chi2: float
     dense_links: bool
     dense_link_sigma: float
     max_fixed_keyframes: int
@@ -189,6 +190,22 @@ class ReuseConfig:
 
 
 @dataclass
+class MapConfig:
+    enabled: bool
+    settle_after: int
+    refuse_translation: float
+    refuse_rotation_deg: float
+    icp_links: bool
+    icp_points: int
+    icp_iters: int
+    icp_huber: float
+    icp_min_overlap: float
+    icp_max_correction: float
+    icp_max_correction_deg: float
+    icp_link_sigma: float
+
+
+@dataclass
 class SlamConfig:
     methods: list[str]
     max_width: int
@@ -200,6 +217,7 @@ class SlamConfig:
     tracker: TrackerConfig
     ba: LocalBAConfig
     reuse: ReuseConfig
+    map: MapConfig
 
 
 @dataclass

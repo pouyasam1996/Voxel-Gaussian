@@ -26,6 +26,8 @@ class Keyframe:
     point_ids: np.ndarray  # (N,) map point of each feature, -1 = none
     rgbd: object  # Open3D RGB-D image
     ref_inliers: int = 0  # inliers of the first frame tracked against it (keyframe rule)
+    color: np.ndarray | None = None  # (H, W, 3) uint8, kept for fusing into the voxel map
+    depth: np.ndarray | None = None  # (H, W) metres
 
 
 @dataclass
