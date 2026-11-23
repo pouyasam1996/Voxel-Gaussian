@@ -69,28 +69,32 @@ class Gaussians3D(nn.Module):
         self.opacity_raw = nn.Parameter(torch.zeros(n))
         self.sh_degree = sh_degree
         self.active_sh_degree = sh_degree
+        self.depth_mode = "center"  # renderer.py: center or plane (render.depth)
 
-    def values(self, cam: Camera | None = None):
+    def values(self, cam: Camera | None = None, means: torch.Tensor | None = None):
         """(means, quats, scales, colors, opacities) as valid values, in render order.
 
         cam: needed for view-dependent colour; without it, only the base colour is used.
+        means: positions computed elsewhere (the shared surface) instead of self.means.
         """
+        means = self.means if means is None else means
         color = self.color_raw
         d = min(self.active_sh_degree, self.sh_degree)
         if cam is not None and d > 0:
             centre = -cam.R.T @ cam.t  # camera position in the world
-            dirs = self.means - centre
+            dirs = means - centre
             dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             k = (d + 1) ** 2 - 1
             color = color + torch.einsum("nk,nkc->nc", sh_basis(dirs, d), self.sh_rest[:, :k])
         return (
-            self.means,
+            means,
             self.quats,
             torch.exp(self.log_scales),
             torch.sigmoid(color),
             torch.sigmoid(self.opacity_raw),
         )
 
-    def forward(self, cam: Camera, background=None, **tile_options):
+    def forward(self, cam: Camera, background=None, means=None, **tile_options):
         """image, depth, alpha, info; tile_options go to tiles.render_tiled()."""
-        return render_tiled(*self.values(cam), cam, background, **tile_options)
+        tile_options.setdefault("depth_mode", self.depth_mode)
+        return render_tiled(*self.values(cam, means), cam, background, **tile_options)

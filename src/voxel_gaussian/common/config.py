@@ -125,6 +125,45 @@ class TrainConfig:
 
 
 @dataclass
+class SurfaceConfig:
+    """One shared voxel-Gaussian surface (optimization/shared_surface.py; base.yaml notes)."""
+
+    mode: str  # free, tied or learned
+    lr_dphi: float
+    start: int
+    dphi_from: str  # both or color
+    dphi_free: float
+    dphi_weight: float
+    slide_free: float
+    slide_weight: float
+    lift_max: float
+    tilt_free_deg: float
+    tilt_weight: float
+    score: bool
+    reference_voxel: float
+    reference_stride: int
+    realign_iters: int
+    realign_points: int
+    realign_huber: float
+
+    def __post_init__(self):
+        if self.mode not in ("free", "tied", "learned"):
+            raise ValueError(f"surface.mode must be free, tied or learned, got {self.mode!r}")
+        if self.dphi_from not in ("both", "color"):
+            raise ValueError(f"surface.dphi_from must be both or color, got {self.dphi_from!r}")
+
+
+@dataclass
+class DepthNoiseConfig:
+    """Synthetic depth noise (datasets/depth_noise.py), for the controlled test on Replica."""
+
+    sigma: float
+    sigma_quad: float
+    smooth_cells: int
+    seed: int
+
+
+@dataclass
 class DenseBAConfig:
     """Dense bundle adjustment of all keyframes (optimization/dense_ba.py; base.yaml notes)."""
 
@@ -169,6 +208,11 @@ class ScheduleConfig:
 class RenderConfig:
     budget_mb: float
     background: list[float]
+    depth: str  # center or plane (gaussians/renderer.py)
+
+    def __post_init__(self):
+        if self.depth not in ("center", "plane"):
+            raise ValueError(f"render.depth must be center or plane, got {self.depth!r}")
 
 
 @dataclass
@@ -277,6 +321,8 @@ class Config:
     gaussians: GaussiansConfig
     refine: RefineConfig
     train: TrainConfig
+    surface: SurfaceConfig
+    depth_noise: DepthNoiseConfig
     dense_ba: DenseBAConfig
     schedule: ScheduleConfig
     render: RenderConfig

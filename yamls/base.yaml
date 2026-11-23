@@ -130,6 +130,39 @@ train:                     # Gaussians on the SLAM's map and poses (scripts/run_
   poses: frozen            # frozen or trainable: cameras trained with the blobs after
                            # refine.warmup steps (the first keyframe never moves)
 
+surface:                   # one shared voxel-Gaussian surface (optimization/shared_surface.py)
+  mode: free               # free: blobs move freely within refine.anchor_radius (Steps 1-2)
+                           # tied: blobs ride on the fused surface, the surface stays (Step 3)
+                           # learned: the photos also correct the surface (Step 4)
+  lr_dphi: 1.0e-4          # surface correction learning rate, m
+  start: 200               # steps of blob-only training before the surface learns
+  dphi_from: both          # both: colour + depth loss move the surface; color: colour only
+                           # (shows what the photos add beyond the depth sensor)
+  dphi_free: 0.01          # correction free up to this, m; squared penalty beyond
+  dphi_weight: 100.0
+  slide_free: 0.5          # sliding along the surface free up to this, voxels
+  slide_weight: 100.0
+  lift_max: 0.0            # cap of a blob's own offset off the surface, voxels (0 = off, so
+                           # every move along the normal goes into the surface)
+  tilt_free_deg: 15.0      # disc tilt from the surface normal free up to this
+  tilt_weight: 1.0
+  score: true              # surface accuracy against a fine map fused from the true poses
+  reference_voxel: 0.01    # its voxel size, m
+  reference_stride: 2      # its depth images: keep every n-th pixel
+  realign_iters: 10        # after training: align each training keyframe's depth to the map,
+                           # plain and corrected (0 = off)
+  realign_points: 2000     # depth points per keyframe
+  realign_huber: 0.02      # gaps beyond this count linearly, m
+
+depth_noise:               # synthetic depth noise added when reading depth (0 = off): the
+                           # controlled test on Replica, whose rendered depth is perfect
+  sigma: 0.0               # per-pixel standard deviation, m ...
+  sigma_quad: 0.0          # ... plus this x depth^2 (Kinect ~0.0025)
+  smooth_cells: 0          # also a smooth per-frame error of the same size: a random field on
+                           # this many cells across the image, blended (0 = off). Unlike
+                           # per-pixel noise, it doesn't average out within one view
+  seed: 0
+
 dense_ba:                  # all keyframe poses corrected together (scripts/run_dense_ba.py)
   stride: 4                # input images: keep 1 of 4 pixels each way (brightness averaged)
   points: 3000             # pixels compared per keyframe (half random, half strongest edges)
@@ -165,3 +198,6 @@ schedule:                  # rounds of fuse -> snap -> re-fuse -> Gaussians -> r
 render:
   budget_mb: 512           # memory budget of the tiled renderer
   background: [0.0, 0.0, 0.0]
+  depth: center            # rendered depth per blob: center (its centre's depth everywhere it
+                           # covers; biased towards the camera on slanted walls) or plane (where
+                           # each pixel's ray meets the blob's disc)

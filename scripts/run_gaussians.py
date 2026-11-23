@@ -1,10 +1,13 @@
-"""Steps 1-2: Gaussians on the SLAM's voxel map, trained with the SLAM's poses fixed or corrected.
+"""Steps 1-4: Gaussians on the SLAM's voxel map, trained with the SLAM's poses fixed or corrected,
+free on the map or riding on one shared surface that the photos may correct.
 
   uv run python scripts/run_slam.py                                          # writes map.pt
   uv run python scripts/run_gaussians.py --set train.slam_run=<SLAM run folder>
   uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.keyframe_every=2
   uv run python scripts/run_gaussians.py --set train.slam_run=<...> refine.steps=2000
   uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.poses=trainable  # Step 2
+  uv run python scripts/run_gaussians.py --set train.slam_run=<...> surface.mode=tied     # Step 3
+  uv run python scripts/run_gaussians.py --set train.slam_run=<...> surface.mode=learned  # Step 4
 
 1. Read the SLAM run's map.pt: the voxel map (fused from the keyframes with their final poses)
    and the pose of every frame. Everything lives in the SLAM's coordinates (frame 0 = origin).
@@ -12,6 +15,8 @@
 3. Train on the keyframes (every keyframe_every-th) with their SLAM poses (optimization/refine.py).
    train.poses=trainable: each keyframe's pose is corrected along with the blobs (Step 2);
    the first keyframe never moves.
+   surface.mode=tied / learned: the blobs' positions come from the voxel surface at every step
+   (optimization/shared_surface.py); learned: the photos also correct the surface.
 4. Score on held-out frames: frames halfway between two keyframes, never fused, never trained,
    drawn twice:
      heldout       from their SLAM poses
@@ -19,12 +24,23 @@
                    shift that best lines the training cameras up with their true poses
 5. Pose accuracy of the training keyframes against the true poses, before and after:
    ATE (position error after lining up the whole path, cm) and rotation error (degrees).
+6. Surface accuracy (surface.score) against a reference surface: the keyframes fused again with
+   their true poses (moved into the map's coordinates) at surface.reference_voxel, from depth
+   without synthetic noise (on TUM that is still real sensor depth). Scored: the fused map, the corrected map (learned mode) and the blob centres, each to
+   the reference's plane (eval/geometry.py, surface_errors_plane).
+7. Camera re-alignment (surface.realign_iters): each training keyframe's depth aligned to the
+   plain map and, in learned mode, to the corrected one (slam/tsdf_icp.py), then ATE again.
+   If the corrected surface is better, cameras aligned to it should land closer to the truth.
+
+depth_noise settings add synthetic noise to every depth image read (training, scoring and
+re-alignment; never the reference), for maps built by run_fusion.py with the same settings.
 
 Images and depth for training and scoring are read from the dataset at train.stride
 (4: 1200x680 -> 300x170, the old repo's setting).
 
 Run folder: results.yaml, training.png, views.png (3 held-out frames: photo / before / after),
-gaussians.ply (blob centres with colour), model.pt (blobs + the frames and poses used).
+gaussians.ply (blob centres with colour), model.pt (blobs + the frames and poses used, and the
+surface correction), surface_corrected.ply (learned mode).
 """
 
 import random
@@ -45,13 +61,17 @@ from voxel_gaussian.common.device import get_device
 from voxel_gaussian.common.env import data_root, output_root
 from voxel_gaussian.common.rotation import rotation_angle_deg
 from voxel_gaussian.common.run import start_run
+from voxel_gaussian.datasets.depth_noise import add_depth_noise
 from voxel_gaussian.datasets.sequence import load_sequence
+from voxel_gaussian.eval.geometry import surface_errors_plane
 from voxel_gaussian.eval.image import depth_scores, psnr, ssim
 from voxel_gaussian.eval.trajectory import align_rigid, ate
 from voxel_gaussian.gaussians.camera import Camera
 from voxel_gaussian.gaussians.init import from_surface
 from voxel_gaussian.optimization.pose_correction import PoseCorrection
 from voxel_gaussian.optimization.refine import train
+from voxel_gaussian.optimization.shared_surface import SharedSurface
+from voxel_gaussian.slam.tsdf_icp import align
 from voxel_gaussian.tsdf.surface import extract_points, save_ply
 from voxel_gaussian.tsdf.volume import TSDFVolume
 
@@ -88,6 +108,7 @@ def load(positions):
     cams, images, depths = [], [], []
     for p in positions:
         color, depth = seq.read(frames[p], cfg.train.stride)
+        depth = add_depth_noise(depth, frames[p], cfg.depth_noise)
         cams.append(Camera.from_pose(K, poses[p], device))
         images.append(torch.from_numpy(color).to(device, torch.float32) / 255)
         depths.append(torch.from_numpy(depth).to(device))
@@ -109,10 +130,20 @@ g = cfg.gaussians
 model = from_surface(
     points, colors, normals, vol.voxel_size, g.width, g.thickness, g.opacity, g.sh_degree
 ).to(device)
+model.depth_mode = cfg.render.depth
+surface = None
+if cfg.surface.mode != "free":
+    surface = SharedSurface(vol, model.means.detach(), cfg.surface, cfg.tsdf.min_weight)
 setup_s = time.time() - t0
 print(
     f"{len(model.means)} blobs from {len(points)} surface points ({vol.voxel_size * 100:.0f} cm voxels), {setup_s:.1f} s"
 )
+if surface is not None:
+    st = surface.stats()
+    print(
+        f"surface {cfg.surface.mode}: {st['attached']} of {st['gaussians']} blobs ride on it, "
+        f"{st['corrected_voxels']} voxel values {'learn' if surface.learn else 'stay fixed'}"
+    )
 
 
 @torch.no_grad()
@@ -145,9 +176,12 @@ if cfg.train.poses == "trainable":  # train_pos[0] is the first keyframe: it sta
 t0 = time.time()
 history, steps_done = train(
     model, train_cams, train_images, train_depths, cfg.refine,
-    cfg.refine.anchor_radius * vol.voxel_size, background, budget, corrections,
+    cfg.refine.anchor_radius * vol.voxel_size, background, budget, corrections, surface,
 )  # fmt: skip
 train_s = time.time() - t0
+if surface is not None:  # from here on the blobs are ordinary blobs at their surface positions
+    with torch.no_grad():
+        model.means.copy_(surface.means()[0])
 slam_cams = train_cams
 if corrections is not None:
     train_cams = corrections.apply(train_cams)
@@ -180,8 +214,57 @@ A[:3, :3], A[:3, 3] = R, shift
 true_held_cams = [
     Camera.from_pose(K, np.linalg.inv(A) @ seq.gt_poses[frames[p]], device) for p in held_pos
 ]
+corrected_vol = surface.corrected(vol) if surface is not None and surface.learn else None
 
-# ------------------------------------------------------------------ 4. score
+# ------------------------------------------------------------------ 4. surface accuracy
+surface_scores, s = {}, cfg.surface
+if s.score:
+    t0 = time.time()
+    t = cfg.tsdf
+    ref_vol = TSDFVolume(s.reference_voxel, t.block, t.trunc_voxels, t.depth_max, device)
+    K_ref = seq.intrinsics.scaled(s.reference_stride)
+    for p in keyframes:  # no synthetic noise; true poses in the map's coordinates
+        color, depth = seq.read(frames[p], s.reference_stride)
+        T = np.linalg.inv(A) @ seq.gt_poses[frames[p]]
+        ref_vol.integrate(depth, color.astype(np.float32) / 255.0, T, K_ref)
+    ref_pts, _, ref_nrm = (x.cpu().numpy() for x in extract_points(ref_vol, t.min_weight))
+    del ref_vol
+    opacity = model.values()[4]
+    candidates = {
+        "fused": extract_points(vol, t.min_weight)[0],
+        "blobs": model.means[opacity > 0.1].detach(),
+    }
+    if corrected_vol is not None:
+        candidates["corrected"] = extract_points(corrected_vol, t.min_weight)[0]
+    for name, pts in candidates.items():
+        surface_scores[name] = surface_errors_plane(pts.cpu().numpy(), ref_pts, ref_nrm)
+    surface_scores["reference_points"] = len(ref_pts)
+    surface_scores["seconds"] = time.time() - t0
+
+# ------------------------------------------------------------------ 5. camera re-alignment
+
+
+def realign(volume: TSDFVolume, cams: list[Camera]) -> list[Camera]:
+    """Each training keyframe's depth aligned to `volume` (ICP against the voxel surface)."""
+    out = []
+    for cam, sensor in zip(cams, train_depths, strict=True):
+        depth = sensor.cpu().numpy()
+        idx = np.flatnonzero(((depth > 0) & (depth < volume.depth_max)).ravel())
+        idx = idx[:: max(1, len(idx) // s.realign_points)]
+        v, u = np.divmod(idx, depth.shape[1])
+        pts = K.backproject(u.astype(float), v.astype(float), depth.ravel()[idx])
+        res = align(volume, pts, cam.pose(), s.realign_iters, s.realign_huber, cfg.tsdf.min_weight)
+        out.append(cam if res is None else Camera.from_pose(K, res["T"], device))
+    return out
+
+
+realigned = {}
+if s.realign_iters > 0:
+    realigned["plain_map"] = pose_accuracy(realign(vol, train_cams))
+    if corrected_vol is not None:
+        realigned["corrected_map"] = pose_accuracy(realign(corrected_vol, train_cams))
+
+# ------------------------------------------------------------------ 6. score and save
 t0 = time.time()
 result = {
     "slam_run": str(slam_dir),
@@ -198,7 +281,14 @@ result = {
     "poses": cfg.train.poses,
     "pose_accuracy_before": poses_before,
     "pose_accuracy_after": poses_after,
+    "surface_mode": cfg.surface.mode,
 }
+if surface is not None:
+    result["surface"] = surface.stats()
+if surface_scores:
+    result["surface_accuracy"] = surface_scores
+if realigned:
+    result["pose_accuracy_realigned"] = realigned
 eval_s = time.time() - t0
 result["seconds"] = {"setup": setup_s, "training": train_s, "scoring": eval_s}
 if device.type == "cuda":
@@ -215,9 +305,15 @@ torch.save(
         "heldout_frames": [frames[p] for p in held_pos],
         "train_poses": torch.from_numpy(np.stack([c.pose() for c in train_cams])),  # trained
         "heldout_poses": torch.from_numpy(poses[held_pos]),
+        # the surface correction, by voxel code (rows of the voxel map move when blocks are added)
+        "surface": None if surface is None else {
+            "codes": surface.codes.cpu(), "dphi": surface.dphi.detach().cpu()
+        },
     },
     run_dir / "model.pt",
-)
+)  # fmt: skip
+if corrected_vol is not None:
+    save_ply(run_dir / "surface_corrected.ply", *extract_points(corrected_vol, cfg.tsdf.min_weight))
 means, _, _, rgb, opacity = model.values()
 keep = opacity > 0.1  # nearly transparent blobs don't show in the images
 save_ply(run_dir / "gaussians.ply", means[keep].detach(), rgb[keep].detach())
@@ -260,3 +356,20 @@ print(
     f"{poses_after['rot_rmse_deg']:.3f} deg\n"
     f"saved results.yaml, training.png, views.png, gaussians.ply, model.pt to {run_dir}"
 )
+if surface is not None:
+    st = result["surface"]
+    print(
+        f"surface ({cfg.surface.mode}): {st['attached']} of {st['gaussians']} blobs attached; "
+        f"correction mean {st['dphi_mm']['mean']:.2f} mm, 95% {st['dphi_mm']['p95']:.2f} mm, "
+        f"max {st['dphi_mm']['max']:.2f} mm"
+    )
+for name, e in {k: v for k, v in surface_scores.items() if isinstance(v, dict)}.items():
+    print(
+        f"surface {name:9s} accuracy {e['accuracy_mm']:.2f} mm (median {e['accuracy_median_mm']:.2f}, "
+        f"{e['within_5mm']:.0%} within 5 mm), completeness {e['completeness_mm']:.2f} mm"
+    )
+for name, a in realigned.items():
+    print(
+        f"cameras aligned to the {name.replace('_', ' ')}: ATE {a['ate_rmse_cm']:.3f} cm, "
+        f"rotation {a['rot_rmse_deg']:.3f} deg"
+    )
