@@ -72,6 +72,7 @@ Every run gets its own folder, `<VG_OUTPUT_ROOT>/<dataset>/<date-time>_<experime
 uv run python scripts/run_slam.py
 uv run python scripts/run_gaussians.py --set train.slam_run=<SLAM run folder name>
 uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.keyframe_every=2   # half the keyframes
+uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.poses=trainable    # Step 2
 ```
 
 ## Stages

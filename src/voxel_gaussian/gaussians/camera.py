@@ -60,6 +60,13 @@ class Camera:
         R = T[:3, :3].T
         return cls(R, -R @ T[:3, 3], K.fx, K.fy, K.cx, K.cy, K.width, K.height).to(device)
 
+    def pose(self) -> np.ndarray:
+        """Back to the SLAM's convention: 4x4 camera -> world (rotation R^T, position -R^T t)."""
+        R, t = self.R.detach().cpu().double().numpy(), self.t.detach().cpu().double().numpy()
+        T = np.eye(4)
+        T[:3, :3], T[:3, 3] = R.T, -R.T @ t
+        return T
+
 
 def world_to_camera(points: torch.Tensor, cam: Camera) -> torch.Tensor:
     """(N, 3) world points -> (N, 3) camera-frame points."""

@@ -117,6 +117,11 @@ class TrainConfig:
     stride: int  # training images: keep every n-th pixel
     keyframe_every: int  # train on every n-th keyframe (2 = half of them)
     max_heldout: int  # held-out frames: halfway between keyframes, at most this many
+    poses: str  # frozen or trainable (training keyframes; the first one never moves)
+
+    def __post_init__(self):
+        if self.poses not in ("frozen", "trainable"):
+            raise ValueError(f"train.poses must be frozen or trainable, got {self.poses!r}")
 
 
 @dataclass

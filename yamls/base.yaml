@@ -106,7 +106,7 @@ gaussians:                 # flat blobs built from the surface, one per surface 
 
 refine:                    # joint training of Gaussians and camera corrections
   steps: 1000              # rendered images per round (0 = no Gaussian training)
-  warmup: 300              # Gaussian-only steps at the start of each round
+  warmup: 200              # Gaussian-only steps before the cameras train too
   depth_weight: 1.0        # depth L1 (m) against colour L1
   anchor_weight: 100.0     # penalty for blobs beyond anchor_radius
   anchor_radius: 1.0       # free movement, in voxels
@@ -127,6 +127,8 @@ train:                     # Gaussians on the SLAM's map and poses (scripts/run_
   stride: 4                # training images: keep every n-th pixel (1200x680 -> 300x170)
   keyframe_every: 1        # train on every n-th keyframe (2 = half of them)
   max_heldout: 100         # held-out frames, halfway between keyframes (never fused, never trained)
+  poses: frozen            # frozen or trainable: cameras trained with the blobs after
+                           # refine.warmup steps (the first keyframe never moves)
 
 schedule:                  # rounds of fuse -> snap -> re-fuse -> Gaussians -> refine
   rounds: 3

@@ -1,17 +1,24 @@
-"""Step 1: Gaussians on the SLAM's voxel map, trained with the SLAM's poses held fixed.
+"""Steps 1-2: Gaussians on the SLAM's voxel map, trained with the SLAM's poses fixed or corrected.
 
   uv run python scripts/run_slam.py                                          # writes map.pt
   uv run python scripts/run_gaussians.py --set train.slam_run=<SLAM run folder>
   uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.keyframe_every=2
   uv run python scripts/run_gaussians.py --set train.slam_run=<...> refine.steps=2000
+  uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.poses=trainable  # Step 2
 
 1. Read the SLAM run's map.pt: the voxel map (fused from the keyframes with their final poses)
    and the pose of every frame. Everything lives in the SLAM's coordinates (frame 0 = origin).
 2. One flat blob per surface voxel of that map (gaussians/init.py).
 3. Train on the keyframes (every keyframe_every-th) with their SLAM poses (optimization/refine.py).
+   train.poses=trainable: each keyframe's pose is corrected along with the blobs (Step 2);
+   the first keyframe never moves.
 4. Score on held-out frames: frames halfway between two keyframes, never fused, never trained,
-   drawn from their SLAM poses (the map lives in the SLAM's coordinates, so true poses would
-   not fit it).
+   drawn twice:
+     heldout       from their SLAM poses
+     heldout_true  from their true poses, moved into the map's coordinates by the one rotation +
+                   shift that best lines the training cameras up with their true poses
+5. Pose accuracy of the training keyframes against the true poses, before and after:
+   ATE (position error after lining up the whole path, cm) and rotation error (degrees).
 
 Images and depth for training and scoring are read from the dataset at train.stride
 (4: 1200x680 -> 300x170, the old repo's setting).
@@ -29,17 +36,21 @@ import matplotlib
 
 matplotlib.use("Agg")  # write files only, never open a window
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import yaml
 
 from voxel_gaussian.common.config import config_from_args, config_parser
 from voxel_gaussian.common.device import get_device
 from voxel_gaussian.common.env import data_root, output_root
+from voxel_gaussian.common.rotation import rotation_angle_deg
 from voxel_gaussian.common.run import start_run
 from voxel_gaussian.datasets.sequence import load_sequence
 from voxel_gaussian.eval.image import depth_scores, psnr, ssim
+from voxel_gaussian.eval.trajectory import align_rigid, ate
 from voxel_gaussian.gaussians.camera import Camera
 from voxel_gaussian.gaussians.init import from_surface
+from voxel_gaussian.optimization.pose_correction import PoseCorrection
 from voxel_gaussian.optimization.refine import train
 from voxel_gaussian.tsdf.surface import extract_points, save_ply
 from voxel_gaussian.tsdf.volume import TSDFVolume
@@ -128,12 +139,47 @@ held_before = scores(held_cams, held_images, held_depths)
 print(f"held-out before training: {held_before['psnr_db']:.2f} dB")
 
 # ------------------------------------------------------------------ 3. train
+corrections = None
+if cfg.train.poses == "trainable":  # train_pos[0] is the first keyframe: it stays put
+    corrections = PoseCorrection(len(train_cams), fixed=(0,)).to(device)
 t0 = time.time()
 history, steps_done = train(
     model, train_cams, train_images, train_depths, cfg.refine,
-    cfg.refine.anchor_radius * vol.voxel_size, background, budget,
+    cfg.refine.anchor_radius * vol.voxel_size, background, budget, corrections,
 )  # fmt: skip
 train_s = time.time() - t0
+slam_cams = train_cams
+if corrections is not None:
+    train_cams = corrections.apply(train_cams)
+
+
+def pose_accuracy(cams) -> dict:
+    """ATE (cm) and rotation error (deg) of the training keyframes against the true poses,
+    after the one rotation + shift that best lines the path up with the true one."""
+    est = np.stack([c.pose() for c in cams])
+    gt = seq.gt_poses[[frames[p] for p in train_pos]]
+    R, _ = align_rigid(est[:, :3, 3], gt[:, :3, 3])
+    rot = [rotation_angle_deg(g[:3, :3].T @ R @ e[:3, :3]) for e, g in zip(est, gt, strict=True)]
+    a = ate(est, gt)
+    return {
+        "ate_rmse_cm": a["rmse_cm"],
+        "ate_median_cm": a["median_cm"],
+        "rot_rmse_deg": float(np.sqrt(np.mean(np.square(rot)))),
+        "rot_median_deg": float(np.median(rot)),
+    }
+
+
+poses_before, poses_after = pose_accuracy(slam_cams), pose_accuracy(train_cams)
+
+# True held-out poses in the map's coordinates. align_rigid gives R, t with true ~ R @ ours + t
+# (camera positions of the training cameras after training), so ours = A^-1 @ true pose.
+est = np.stack([c.pose() for c in train_cams])
+R, shift = align_rigid(est[:, :3, 3], seq.gt_poses[[frames[p] for p in train_pos]][:, :3, 3])
+A = np.eye(4)
+A[:3, :3], A[:3, 3] = R, shift
+true_held_cams = [
+    Camera.from_pose(K, np.linalg.inv(A) @ seq.gt_poses[frames[p]], device) for p in held_pos
+]
 
 # ------------------------------------------------------------------ 4. score
 t0 = time.time()
@@ -147,7 +193,11 @@ result = {
     "steps": steps_done,
     "training": scores(train_cams, train_images, train_depths),
     "heldout": scores(held_cams, held_images, held_depths),
+    "heldout_true": scores(true_held_cams, held_images, held_depths),
     "heldout_before_training": held_before,
+    "poses": cfg.train.poses,
+    "pose_accuracy_before": poses_before,
+    "pose_accuracy_after": poses_after,
 }
 eval_s = time.time() - t0
 result["seconds"] = {"setup": setup_s, "training": train_s, "scoring": eval_s}
@@ -163,7 +213,7 @@ torch.save(
         "model": model.state_dict(),
         "train_frames": [frames[p] for p in train_pos],
         "heldout_frames": [frames[p] for p in held_pos],
-        "train_poses": torch.from_numpy(poses[train_pos]),
+        "train_poses": torch.from_numpy(np.stack([c.pose() for c in train_cams])),  # trained
         "heldout_poses": torch.from_numpy(poses[held_pos]),
     },
     run_dir / "model.pt",
@@ -198,11 +248,15 @@ fig.tight_layout()
 fig.savefig(run_dir / "views.png", dpi=120)
 plt.close(fig)
 
-t, h = result["training"], result["heldout"]
+t, h, ht = result["training"], result["heldout"], result["heldout_true"]
 print(
     f"\n{result['blobs']} blobs, {result['steps']} steps in {train_s:.0f} s\n"
     f"training  PSNR {t['psnr_db']:.2f} dB  SSIM {t['ssim']:.3f}  depth {t['depth_error_cm']:.2f} cm  coverage {t['coverage']:.1%}\n"
     f"held-out  PSNR {h['psnr_db']:.2f} dB  SSIM {h['ssim']:.3f}  depth {h['depth_error_cm']:.2f} cm  coverage {h['coverage']:.1%}"
     f"  (before training {held_before['psnr_db']:.2f} dB)\n"
+    f"held-out from true poses  PSNR {ht['psnr_db']:.2f} dB  SSIM {ht['ssim']:.3f}  depth {ht['depth_error_cm']:.2f} cm\n"
+    + f"training keyframes ({cfg.train.poses}): ATE {poses_before['ate_rmse_cm']:.2f} -> "
+    f"{poses_after['ate_rmse_cm']:.2f} cm, rotation {poses_before['rot_rmse_deg']:.3f} -> "
+    f"{poses_after['rot_rmse_deg']:.3f} deg\n"
     f"saved results.yaml, training.png, views.png, gaussians.ply, model.pt to {run_dir}"
 )
