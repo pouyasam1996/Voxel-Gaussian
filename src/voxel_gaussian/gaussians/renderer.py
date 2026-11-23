@@ -18,6 +18,17 @@ centre, so only what is visible is computed:
   6. recompute each group's blending runs under torch.utils.checkpoint: forward keeps only
                the inputs, backward recomputes the tables (2x compute, fixed memory)
 The picture is exact except for the 1/255 cut-off and light_eps (at most 0.001 of light).
+
+Depth (depth_mode):
+  center  every pixel a blob covers gets the depth of the blob's centre (the usual 3DGS rule).
+          On a wall seen at a slant, neighbouring flat blobs overlap with different centre
+          depths, and front-to-back blending favours the nearer ones: the rendered depth comes
+          out too near (about 1 cm with 5 cm voxels on Replica room0, measured on blobs placed
+          exactly on the fused surface).
+  plane   a blob is treated as a flat disc: at each pixel, the depth where that pixel's ray
+          meets the disc's plane (through its centre, across its thinnest axis), linearized
+          around the centre: z0 + gu * du + gv * dv. Blobs on one wall then agree at every pixel.
+          Slopes are capped at max_slope metres per pixel (planes seen almost edge-on).
 """
 
 import math
@@ -25,7 +36,13 @@ import math
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from voxel_gaussian.gaussians.camera import Camera, covariance_3d, project, world_to_camera
+from voxel_gaussian.gaussians.camera import (
+    Camera,
+    covariance_3d,
+    project,
+    quat_to_rotmat,
+    world_to_camera,
+)
 
 NEAR = 0.2  # blobs closer than this to the camera are dropped
 BLUR = 0.3  # added to the 2D ellipse diagonal so no blob is smaller than a pixel
@@ -48,6 +65,8 @@ def render_tiled(
     buckets=(16, 32, 64, 128, 256),
     budget_mb: float = 512,
     light_eps: float = 1e-3,
+    depth_mode: str = "center",
+    max_slope: float = 0.05,
 ):
     """means (N, 3), quats (N, 4), scales (N, 3), colors (N, 3) in [0, 1], opacities (N,).
     Returns image (H, W, 3), depth (H, W), alpha (H, W), info.
@@ -65,11 +84,17 @@ def render_tiled(
 
     ids, mean2d, z, cov, inv = project_blobs(means, quats, scales, cam)
     colors, opacities = colors[ids], opacities[ids]
+    slope = None
+    if depth_mode == "plane":
+        slope = depth_slopes(means[ids], quats[ids], scales[ids], cam, max_slope)
+    elif depth_mode != "center":
+        raise ValueError(f"depth_mode must be center or plane, got {depth_mode!r}")
 
     blob, tile = make_pairs(mean2d, z, cov, opacities, nx, ny)
     color, depth, light, drawn, passes = blend_pairs(
-        blob, tile, mean2d, inv, colors, opacities, z, nx, ny, buckets, budget_mb, light_eps
-    )
+        blob, tile, mean2d, inv, colors, opacities, z, nx, ny, buckets, budget_mb, light_eps,
+        slope,
+    )  # fmt: skip
 
     def to_image(x):  # (tiles, PIX, ...) -> (H, W, ...)
         x = x.reshape(ny, nx, TILE, TILE, *x.shape[2:]).transpose(1, 2)
@@ -108,6 +133,26 @@ def project_blobs(means, quats, scales, cam: Camera):
     c = cov2d[:, 1, 1] + BLUR
     det = a * c - b * b
     return ids, mean2d, z, (a, b, c), (c / det, -b / det, a / det)
+
+
+def depth_slopes(means, quats, scales, cam: Camera, max_slope: float):
+    """(n, 2) change of depth per pixel along u and v on each blob's plane (depth_mode plane).
+
+    Plane through the centre m (camera frame) with normal nrm: nrm . X = k, k = nrm . m.
+    Pixel (u, v) looks along r = ((u - cx) / fx, (v - cy) / fy, 1); it meets the plane at
+    depth z = k / (nrm . r). At the centre z = z0, and the slopes are
+        dz/du = -z0^2 nrm_x / (fx k),   dz/dv = -z0^2 nrm_y / (fy k).
+    """
+    R = quat_to_rotmat(quats)
+    thin = torch.argmin(scales, dim=-1)  # the axis across the disc
+    nrm = R.gather(2, thin[:, None, None].expand(-1, 3, 1)).squeeze(2) @ cam.R.T  # camera frame
+    m = world_to_camera(means, cam)
+    k = (nrm * m).sum(-1)
+    k = torch.where(k.abs() < 1e-6, torch.full_like(k, 1e-6), k)  # plane through the camera
+    z0 = m[:, 2]
+    gu = -(z0**2) * nrm[:, 0] / (cam.fx * k)
+    gv = -(z0**2) * nrm[:, 1] / (cam.fy * k)
+    return torch.stack([gu, gv], dim=-1).clamp(-max_slope, max_slope)
 
 
 def blob_reach(opacities):
@@ -154,12 +199,16 @@ def make_pairs(mean2d, z, cov, opacities, nx, ny):
 
 
 def blend_pairs(
-    blob, tile, mean2d, inv, colors, opacities, z, nx, ny, buckets, budget_mb, light_eps
-):
+    blob, tile, mean2d, inv, colors, opacities, z, nx, ny, buckets, budget_mb, light_eps,
+    slope=None,
+):  # fmt: skip
     """Steps 3-6: front-to-back blending of the sorted pairs, in passes, buckets and groups.
 
+    slope: (n, 2) depth change per pixel (depth_mode plane), or None (centre depth).
     Returns color (T, PIX, 3), depth (T, PIX), light left (T, PIX), drawn (n,) bool, passes.
     """
+    if slope is None:
+        slope = torch.zeros(len(z), 2, device=z.device, dtype=z.dtype)
     dev, dtype = z.device, z.dtype
     n_tiles = nx * ny
     sizes = torch.tensor(sorted(buckets), device=dev)
@@ -216,7 +265,7 @@ def blend_pairs(
                 py = ((tg // nx) * TILE).to(dtype)[:, None] + oy
                 args = (
                     px, py, mean2d[idx], A[idx], B[idx], C[idx],
-                    opacities[idx] * real, colors[idx], z[idx], light[tg],
+                    opacities[idx] * real, colors[idx], z[idx], slope[idx], light[tg],
                 )  # fmt: skip
                 # Step 6, recompute: keep only the inputs; rebuild the tables in backward.
                 if torch.is_grad_enabled():
@@ -229,11 +278,12 @@ def blend_pairs(
     return color, depth, light, drawn, passes
 
 
-def blend_group(px, py, mean2d, A, B, C, opacity, color, z, light_in):
+def blend_group(px, py, mean2d, A, B, C, opacity, color, z, slope, light_in):
     """Blending for g tiles with K blob slots each (padding has opacity 0).
 
     px, py (g, PIX); mean2d (g, K, 2); A, B, C, opacity, z (g, K); color (g, K, 3);
-    light_in (g, PIX) = light left after earlier passes.
+    slope (g, K, 2) depth per pixel along u, v; light_in (g, PIX) = light left after earlier
+    passes.
     Returns color (g, PIX, 3), depth (g, PIX), light left (g, PIX).
     """
     dx = px[:, None, :] - mean2d[..., 0:1]  # (g, K, PIX)
@@ -245,5 +295,6 @@ def blend_group(px, py, mean2d, A, B, C, opacity, color, z, light_in):
     before = torch.cat([torch.ones_like(left[:, :1]), left[:, :-1]], dim=1)
     weight = alpha * before * light_in[:, None, :]
     color_out = torch.einsum("gkp,gkc->gpc", weight, color)
-    depth_out = torch.einsum("gkp,gk->gp", weight, z)
+    z_pix = z[..., None] + slope[..., 0:1] * dx + slope[..., 1:2] * dy  # (g, K, PIX)
+    depth_out = (weight * z_pix).sum(dim=1)
     return color_out, depth_out, light_in * left[:, -1]

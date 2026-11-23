@@ -44,7 +44,7 @@ scripts → optimization → slam → tsdf → datasets → common
                     ↘ gaussians ──────────────↗
 ```
 
-`gaussians` never imports `slam` or `tsdf`; only `optimization/coupling.py` joins Gaussians and the TSDF.
+`gaussians` never imports `slam` or `tsdf`; only `optimization/` (e.g. `shared_surface.py`) joins Gaussians and the TSDF.
 
 ## Settings
 
@@ -83,6 +83,28 @@ uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.poses=tr
 uv run python scripts/run_dense_ba.py --set train.slam_run=<SLAM run folder>
 uv run python scripts/run_dense_ba.py --experiment tum --set data.dataset=tum_fr1_desk train.slam_run=<...>
 uv run python scripts/run_gaussians.py --set train.slam_run=<dense BA run folder>
+```
+
+## One shared surface (Steps 3-4)
+
+`surface.mode` decides where the blobs are:
+- `free`: anywhere within `refine.anchor_radius` of where they started (Steps 1-2).
+- `tied`: each blob belongs to a voxel cell and sits on the fused surface, computed from the voxel values at every step (Step 3).
+- `learned`: the same, and the photos also correct the voxel values, so the surface itself moves (Step 4).
+
+Every run also scores the surface against the keyframes fused again with their true poses at 1 cm, and aligns the training keyframes to the map (and to the corrected map in `learned` mode) to see whether the cameras improve.
+
+```bash
+uv run python scripts/run_gaussians.py --set train.slam_run=<dense BA run> surface.mode=tied
+uv run python scripts/run_gaussians.py --set train.slam_run=<dense BA run> surface.mode=learned
+uv run python scripts/run_gaussians.py --set train.slam_run=<dense BA run> surface.mode=learned surface.dphi_from=color
+```
+
+Controlled test: a map from the true poses with noisy depth, where the photos have something to correct. Use the same `depth_noise` settings for both scripts.
+
+```bash
+uv run python scripts/run_fusion.py --set train.slam_run=<dense BA run> depth_noise.sigma_quad=0.0025 depth_noise.smooth_cells=8
+uv run python scripts/run_gaussians.py --set train.slam_run=<fusion run> depth_noise.sigma_quad=0.0025 depth_noise.smooth_cells=8 surface.mode=learned
 ```
 
 ## Stages
