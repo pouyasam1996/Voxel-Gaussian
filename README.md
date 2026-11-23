@@ -75,6 +75,16 @@ uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.keyframe
 uv run python scripts/run_gaussians.py --set train.slam_run=<...> train.poses=trainable    # Step 2
 ```
 
+## Dense bundle adjustment
+
+`run_dense_ba.py` corrects all keyframe poses of a SLAM run together: every pair of keyframes that see the same part of the room is compared pixel by pixel (depth and brightness), and all poses are solved at once. The other frames are then aligned to their two neighbouring keyframes, and the voxel map is fused again. Its run folder has a `map.pt` that `run_gaussians.py` reads like the SLAM's.
+
+```bash
+uv run python scripts/run_dense_ba.py --set train.slam_run=<SLAM run folder>
+uv run python scripts/run_dense_ba.py --experiment tum --set data.dataset=tum_fr1_desk train.slam_run=<...>
+uv run python scripts/run_gaussians.py --set train.slam_run=<dense BA run folder>
+```
+
 ## Stages
 
 One git branch per stage. A stage ends with its results table in `outputs/`. The next stage starts only when "done when" is met.

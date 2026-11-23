@@ -130,6 +130,33 @@ train:                     # Gaussians on the SLAM's map and poses (scripts/run_
   poses: frozen            # frozen or trainable: cameras trained with the blobs after
                            # refine.warmup steps (the first keyframe never moves)
 
+dense_ba:                  # all keyframe poses corrected together (scripts/run_dense_ba.py)
+  stride: 4                # input images: keep 1 of 4 pixels each way (brightness averaged)
+  points: 3000             # pixels compared per keyframe (half random, half strongest edges)
+  cell: 0.2                # graph: the scene is cut into cells this big, m; two keyframes are
+  min_overlap: 0.3         # linked when they share this share of the smaller one's cells
+  near: 4                  # links kept per keyframe among keyframes within far_gap in time
+  far: 6                   # links kept among the others: revisits, the links that see drift
+  far_gap: 15              # keyframes
+  sigma_depth: 0.002       # typical depth gap of a correct pixel pair, m ...
+  sigma_depth_quad: 0.0    # ... plus this x depth^2 (Kinect ~0.0025; rendered depth: 0)
+  sigma_color: 0.03        # typical brightness gap (0..1)
+  color_weight: 1.0        # 0 = depth only (converges far slower: flat walls slide)
+  huber: 2.0               # gaps beyond this many sigmas count linearly (wrong pairs)
+  gates: [0.08, 0.03]      # per level, coarse -> fine: drop pairs whose depths differ more, m
+  levels: [2, 1]           # per level: shrink of the input images (2 = half size)
+  iterations: [10, 10]     # Gauss-Newton steps per level (stops earlier when nothing moves)
+  damping: 1.0e-4          # Levenberg-Marquardt start
+  max_drop: 0.03           # a step may lose at most this share of the pixel pairs
+  spring_trans: 0.005      # consecutive keyframes keep the SLAM's motion between them within
+  spring_rot_deg: 0.25     # about this much (soft): stops a keyframe seeing one flat wall
+                           # from sliding along it
+  chunk: 256               # pairs evaluated together (memory)
+  frames: all              # then every other frame is aligned to its two neighbouring
+                           # keyframes (held fixed): all, heldout (only the frames
+                           # run_gaussians.py scores, with train.max_heldout) or none
+  frame_chunk: 150         # frames aligned together (memory)
+
 schedule:                  # rounds of fuse -> snap -> re-fuse -> Gaussians -> refine
   rounds: 3
   stop_deg: 0.01           # stop early: mean camera rotation change between rounds
