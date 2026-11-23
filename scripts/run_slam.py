@@ -9,7 +9,8 @@ Poses are estimated from scratch (frame 0 = identity); true poses are only used 
 
 Run folder: gt.txt, slam.txt (every frame), keyframes.txt (TUM format), results.yaml,
 trajectories.png, surface.ply (our voxel map) and surface_true_poses.ply (the same keyframes
-fused with the true poses; results.yaml compares the two). Compare with step 1 (scripts/run_odometry.py) on the same frames.
+fused with the true poses; results.yaml compares the two), map.pt (voxel map + poses, read by
+scripts/run_gaussians.py). Compare with step 1 (scripts/run_odometry.py) on the same frames.
 Cross-check with evo:  evo_ape tum gt.txt slam.txt -a
 """
 
@@ -18,6 +19,7 @@ import time
 from collections import Counter
 
 import numpy as np
+import torch
 import yaml
 
 from voxel_gaussian.common.config import config_from_args, config_parser
@@ -123,6 +125,18 @@ if tracker.mapper is not None:
         ref.integrate(kf.depth, kf.color.astype(np.float32) / 255.0, gt[kf.frame], K)
     ref_pts, ref_cols, ref_normals = extract_points(ref, t.min_weight)
     save_ply(run_dir / "surface_true_poses.ply", ref_pts, ref_cols, ref_normals)
+    # The map and poses for the Gaussians (scripts/run_gaussians.py). Positions in `frames`
+    # (this run's frame list) index `poses`; frames[k] is the dataset frame number.
+    torch.save(
+        {
+            "tsdf": mapper.vol.state(),
+            "frames": list(frames),
+            "poses": torch.from_numpy(est),
+            "keyframes": list(kf_frames),
+            "stride": stride,
+        },
+        run_dir / "map.pt",
+    )
     # our map is in SLAM's frame (frame 0 = origin): move it like the ATE alignment does
     R, shift = align_rigid(kf_poses[:, :3, 3], gt[kf_frames][:, :3, 3])
     surface = surface_errors(pts.cpu().numpy() @ R.T + shift, ref_pts.cpu().numpy())

@@ -5,3 +5,6 @@
 slam:
   ba:
     dense_link_sigma: 0.0037
+dense_ba:                  # Kinect depth noise grows with distance squared
+  sigma_depth: 0.002
+  sigma_depth_quad: 0.0025

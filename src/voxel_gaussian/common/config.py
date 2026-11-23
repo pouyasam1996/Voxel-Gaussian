@@ -112,6 +112,53 @@ class RefineConfig:
 
 
 @dataclass
+class TrainConfig:
+    slam_run: str | None  # SLAM run folder holding map.pt (scripts/run_gaussians.py)
+    stride: int  # training images: keep every n-th pixel
+    keyframe_every: int  # train on every n-th keyframe (2 = half of them)
+    max_heldout: int  # held-out frames: halfway between keyframes, at most this many
+    poses: str  # frozen or trainable (training keyframes; the first one never moves)
+
+    def __post_init__(self):
+        if self.poses not in ("frozen", "trainable"):
+            raise ValueError(f"train.poses must be frozen or trainable, got {self.poses!r}")
+
+
+@dataclass
+class DenseBAConfig:
+    """Dense bundle adjustment of all keyframes (optimization/dense_ba.py; base.yaml notes)."""
+
+    stride: int
+    points: int
+    cell: float
+    min_overlap: float
+    near: int
+    far: int
+    far_gap: int
+    sigma_depth: float
+    sigma_depth_quad: float
+    sigma_color: float
+    color_weight: float
+    huber: float
+    gates: list[float]
+    levels: list[int]
+    iterations: list[int]
+    damping: float
+    max_drop: float
+    spring_trans: float
+    spring_rot_deg: float
+    chunk: int
+    frames: str  # all, heldout or none: other frames aligned to their two keyframes
+    frame_chunk: int
+
+    def __post_init__(self):
+        if self.frames not in ("all", "heldout", "none"):
+            raise ValueError(f"dense_ba.frames must be all, heldout or none, got {self.frames!r}")
+        if not (len(self.gates) == len(self.levels) == len(self.iterations)):
+            raise ValueError("dense_ba: gates, levels and iterations need one value per level")
+
+
+@dataclass
 class ScheduleConfig:
     rounds: int
     stop_deg: float
@@ -229,6 +276,8 @@ class Config:
     icp: ICPConfig
     gaussians: GaussiansConfig
     refine: RefineConfig
+    train: TrainConfig
+    dense_ba: DenseBAConfig
     schedule: ScheduleConfig
     render: RenderConfig
     dataset: DatasetConfig  # filled from yamls/datasets/, not from base.yaml
