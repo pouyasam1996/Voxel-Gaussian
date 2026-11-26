@@ -27,6 +27,8 @@ from voxel_gaussian.tsdf.volume import TSDFVolume
 
 
 class Mapper:
+    """Voxel map of the settled keyframes: fuses them, re-fuses moved ones, aligns new ones."""
+
     def __init__(self, K: Intrinsics, tsdf: TSDFConfig, cfg: MapConfig, device):
         self.K, self.cfg, self.min_weight = K, cfg, tsdf.min_weight
         self.vol = TSDFVolume(tsdf.voxel, tsdf.block, tsdf.trunc_voxels, tsdf.depth_max, device)
@@ -42,6 +44,7 @@ class Mapper:
     # ------------------------------------------------------------------ fusion
 
     def _fuse(self, kf: Keyframe, T_wc: np.ndarray, remove: bool = False) -> np.ndarray:
+        """Fuse kf's RGB-D into the volume at pose T_wc (or remove it); returns touched blocks."""
         t0 = time.perf_counter()
         color = kf.color.astype(np.float32) / 255.0
         codes = self.vol.integrate(kf.depth, color, T_wc, self.K, remove=remove)

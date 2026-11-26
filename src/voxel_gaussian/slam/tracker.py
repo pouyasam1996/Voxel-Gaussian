@@ -51,13 +51,17 @@ from voxel_gaussian.slam.mapper import Mapper
 
 @dataclass
 class FrameRecord:
+    """One frame's result: its pose relative to a keyframe, and how it was tracked."""
+
     kf: int  # keyframe the pose is stored against
     T_kc: np.ndarray  # pose relative to that keyframe
     status: str  # init, pnp, dense, promoted, reloc, lost
 
 
 @dataclass
-class Candidate:  # a successfully tracked frame (also the material for a new keyframe)
+class Candidate:
+    """A successfully tracked frame (also the material for a new keyframe)."""
+
     index: int
     T_wc: np.ndarray
     feats: Features
@@ -67,6 +71,8 @@ class Candidate:  # a successfully tracked frame (also the material for a new ke
 
 
 class Tracker:
+    """Keyframe tracker: ORB + PnP per frame, dense links and bundle adjustment per keyframe."""
+
     def __init__(
         self, K: Intrinsics, cfg: SlamConfig, tsdf: TSDFConfig | None = None, device="cpu"
     ):
@@ -98,12 +104,17 @@ class Tracker:
         return np.stack([self.map.keyframes[f.kf].T_wc @ f.T_kc for f in self.frames])
 
     def keyframe_poses(self) -> tuple[list[int], np.ndarray]:
+        """(frame index of each keyframe, (M, 4, 4) camera -> world poses)."""
         kfs = self.map.keyframes
         return [k.frame for k in kfs], np.stack([k.T_wc for k in kfs])
 
     # ------------------------------------------------------------------ per frame
 
     def process(self, color: np.ndarray, depth: np.ndarray) -> str:
+        """Track one RGB-D frame and make it a keyframe if needed; returns its status.
+
+        Status: init, pnp, dense, promoted, reloc or lost, with "+kf" when it became a keyframe.
+        """
         k = len(self.frames)
         feats = self.extract(color, depth)
         if self.kf is None:
@@ -158,13 +169,16 @@ class Tracker:
         self.frames[cand.index] = FrameRecord(self.kf.id, np.eye(4), status)
 
     def _pose(self, k: int) -> np.ndarray:
+        """Current camera -> world pose of frame k (through its keyframe)."""
         f = self.frames[k]
         return self.map.keyframes[f.kf].T_wc @ f.T_kc
 
     def _record(self, T_wc: np.ndarray, status: str) -> None:
+        """Store the next frame's pose T_wc relative to the current keyframe."""
         self.frames.append(FrameRecord(self.kf.id, np.linalg.inv(self.kf.T_wc) @ T_wc, status))
 
     def _plausible(self, T_wc: np.ndarray, pred: np.ndarray) -> bool:
+        """True if T_wc is within the allowed jump of the predicted pose."""
         dist, angle = pose_change(pred, T_wc)
         return dist < self.t.max_jump_translation and angle < self.t.max_jump_rotation_deg
 
@@ -191,6 +205,7 @@ class Tracker:
         return T_wc, list(zip(ia[inl].tolist(), pids[inl].tolist(), strict=True)), len(inl)
 
     def _track_dense(self, color, depth, pred) -> np.ndarray | None:
+        """Pose by dense alignment with the current keyframe, or None if it fails."""
         kf = self.kf
         ok, T_kc, _ = self.dense.align(
             self.dense.rgbd(color, depth), kf.rgbd, np.linalg.inv(kf.T_wc) @ pred
@@ -216,6 +231,7 @@ class Tracker:
         return best[0], best[1], best[2]
 
     def _needs_keyframe(self, cand: Candidate, status: str, inliers: int) -> bool:
+        """True if the tracked frame should become the next keyframe."""
         dist, angle = pose_change(self.kf.T_wc, cand.T_wc)
         return (
             status in ("dense", "reloc")  # features weak or just relocalized: refresh
@@ -228,6 +244,7 @@ class Tracker:
     # ------------------------------------------------------------------ per keyframe
 
     def _new_keyframe(self, cand: Candidate) -> None:
+        """Turn a tracked frame into a keyframe: dense link, map points, BA, fusion."""
         t0 = time.perf_counter()
         keep = cand.feats.depth > 0
         new_index = -np.ones(len(keep), int)

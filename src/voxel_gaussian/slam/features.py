@@ -15,24 +15,30 @@ from voxel_gaussian.common.config import OrbOdometryConfig
 
 @dataclass
 class Features:
+    """ORB features of one image: pixel positions, pyramid levels, descriptors, depth."""
+
     xy: np.ndarray  # (N, 2) pixel positions
     octave: np.ndarray  # (N,) pyramid level where found; pixel noise grows by scale^level
     desc: np.ndarray  # (N, 32) uint8 descriptors
     depth: np.ndarray  # (N,) metres; 0 = no usable depth
 
     def subset(self, keep: np.ndarray) -> "Features":
+        """The features selected by `keep` (boolean mask or indices)."""
         return Features(self.xy[keep], self.octave[keep], self.desc[keep], self.depth[keep])
 
 
 class OrbExtractor:
+    """Finds ORB features in a colour image and reads their depth (0 on object edges)."""
+
     def __init__(self, cfg: OrbOdometryConfig, depth_max: float, edge_depth_ratio: float):
-        self.orb = cv2.ORB_create(
+        self.orb = cv2.ORB.create(
             nfeatures=cfg.features, scaleFactor=cfg.scale_factor, nlevels=cfg.levels
         )
         self.depth_max, self.edge_ratio = depth_max, edge_depth_ratio
         self.kernel = np.ones((3, 3), np.uint8)
 
     def __call__(self, color: np.ndarray, depth: np.ndarray) -> Features:
+        """ORB features of an RGB image, with the depth at each one (0 = untrusted)."""
         gray = cv2.cvtColor(color, cv2.COLOR_RGB2GRAY)
         keypoints, desc = self.orb.detectAndCompute(gray, None)
         if desc is None:  # no corners at all (e.g. a blank wall)

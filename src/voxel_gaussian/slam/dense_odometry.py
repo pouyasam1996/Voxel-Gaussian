@@ -31,6 +31,8 @@ JACOBIANS = {
 
 
 class DenseOdometry:
+    """Dense RGB-D alignment (Open3D): keyframe links, dense fallback tracking, baseline odometry."""
+
     def __init__(self, K: Intrinsics, cfg: DenseOdometryConfig, depth_max: float):
         self.K = o3d.camera.PinholeCameraIntrinsic(K.width, K.height, K.fx, K.fy, K.cx, K.cy)
         self.jacobian = JACOBIANS[cfg.method]()
@@ -61,7 +63,7 @@ class DenseOdometry:
         return ok, np.asarray(motion), np.asarray(info)
 
     def rgbd(self, color: np.ndarray, depth: np.ndarray) -> o3d.geometry.RGBDImage:
-        # Colour becomes brightness in [0, 1]; depth is already in metres (depth_scale = 1).
+        """Open3D RGB-D image for align(): colour -> brightness in [0, 1], depth in metres."""
         return o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(np.ascontiguousarray(color)),
             o3d.geometry.Image(np.ascontiguousarray(depth, dtype=np.float32)),

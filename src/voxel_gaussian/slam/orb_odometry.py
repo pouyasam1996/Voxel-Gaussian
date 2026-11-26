@@ -23,9 +23,11 @@ from voxel_gaussian.common.config import OrbOdometryConfig
 
 
 class OrbOdometry:
+    """Frame-to-frame ORB odometry: match with the previous frame, pose from PnP."""
+
     def __init__(self, K: Intrinsics, cfg: OrbOdometryConfig, depth_max: float):
         self.K, self.Km, self.cfg, self.depth_max = K, K.matrix(), cfg, depth_max
-        self.orb = cv2.ORB_create(
+        self.orb = cv2.ORB.create(
             nfeatures=cfg.features, scaleFactor=cfg.scale_factor, nlevels=cfg.levels
         )
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)

@@ -19,6 +19,8 @@ from voxel_gaussian.slam.features import Features
 
 @dataclass
 class Keyframe:
+    """A frame kept as a fixed reference: pose, features with depth, their map points, RGB-D."""
+
     id: int
     frame: int  # position in the run's frame list
     T_wc: np.ndarray  # pose, camera -> world
@@ -32,11 +34,15 @@ class Keyframe:
 
 @dataclass
 class MapPoint:
+    """One physical 3D point: world position and which feature of each keyframe saw it."""
+
     X: np.ndarray  # world position
     obs: dict[int, int] = field(default_factory=dict)  # keyframe id -> feature index
 
 
 class Map:
+    """All keyframes, map points and dense links between consecutive keyframes."""
+
     def __init__(self):
         self.keyframes: list[Keyframe] = []  # id = position in this list
         self.points: dict[int, MapPoint] = {}
@@ -44,6 +50,7 @@ class Map:
         self._next_point = 0
 
     def add_point(self, X: np.ndarray, kf: Keyframe, feature: int) -> int:
+        """New map point at world position X, seen by `feature` of kf; returns its id."""
         pid = self._next_point
         self._next_point += 1
         self.points[pid] = MapPoint(X.copy())
@@ -51,6 +58,7 @@ class Map:
         return pid
 
     def observe(self, pid: int, kf: Keyframe, feature: int) -> None:
+        """Record that `feature` of kf is a sighting of point pid (both directions)."""
         self.points[pid].obs[kf.id] = feature
         kf.point_ids[feature] = pid
 

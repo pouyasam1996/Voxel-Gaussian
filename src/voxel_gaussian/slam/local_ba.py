@@ -40,6 +40,8 @@ FIXED = gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)
 
 
 class LocalBA:
+    """Local bundle adjustment (GTSAM) over the newest keyframes, their points and links."""
+
     def __init__(self, K: Intrinsics, cfg: LocalBAConfig, scale_factor: float):
         self.cfg = cfg
         self.cal = gtsam.Cal3_S2Stereo(K.fx, K.fy, 0.0, K.cx, K.cy, cfg.baseline)
@@ -50,9 +52,11 @@ class LocalBA:
         self._link_factors: list = []
 
     def sigma(self, octave: int) -> float:
+        """Pixel noise of a feature found at pyramid level `octave` (scale^octave)."""
         return self.scale**octave
 
     def _noise(self, octave: int):
+        """Robust (Huber) 3D stereo noise model for a pyramid level, cached."""
         if octave not in self.noise:
             base = gtsam.noiseModel.Isotropic.Sigma(3, self.sigma(octave))
             self.noise[octave] = gtsam.noiseModel.Robust.Create(self.huber, base)
@@ -164,6 +168,11 @@ class LocalBA:
         }
 
     def _build(self, mp: Map, kf_ids: list[int], fixed: list[int], pids: list[int]):
+        """Factor graph and initial values for the window: sightings, dense links, anchors.
+
+        Returns (graph, values, sightings); sightings are (factor, point id, keyframe id, octave),
+        used afterwards to find and drop outliers.
+        """
         graph, values, sightings = gtsam.NonlinearFactorGraph(), gtsam.Values(), []
         for i in kf_ids:
             pose = gtsam.Pose3(mp.keyframes[i].T_wc)
