@@ -154,6 +154,26 @@ class SurfaceConfig:
 
 
 @dataclass
+class AdaptiveConfig:
+    """Two-level voxel map (tsdf/adaptive.py)."""
+
+    enabled: bool
+    fine_factor: int
+    share: float
+    max_distance: float
+
+
+@dataclass
+class DensifyConfig:
+    """Splitting and removing blobs during training (gaussians/densify.py)."""
+
+    rounds: int
+    share: float
+    views: int
+    min_opacity: float
+
+
+@dataclass
 class DepthNoiseConfig:
     """Synthetic depth noise (datasets/depth_noise.py), for the controlled test on Replica."""
 
@@ -322,6 +342,8 @@ class Config:
     refine: RefineConfig
     train: TrainConfig
     surface: SurfaceConfig
+    adaptive: AdaptiveConfig
+    densify: DensifyConfig
     depth_noise: DepthNoiseConfig
     dense_ba: DenseBAConfig
     schedule: ScheduleConfig

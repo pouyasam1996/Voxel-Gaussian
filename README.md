@@ -107,6 +107,16 @@ uv run python scripts/run_fusion.py --set train.slam_run=<dense BA run> depth_no
 uv run python scripts/run_gaussians.py --set train.slam_run=<fusion run> depth_noise.sigma_quad=0.0025 depth_noise.smooth_cells=8 surface.mode=learned
 ```
 
+## Adaptive detail (Step 5)
+
+- `adaptive.enabled=true`: the 30% of the 40 cm surface blocks where the surface bends most are fused again at 2.5 cm (`tsdf/adaptive.py`); the rest stays at 5 cm. Gaussians come from both levels, each sized to its own voxels.
+- `densify.rounds=2`: training is cut into 3 parts; in between, the 5% of Gaussians with the largest colour error are split into 4 smaller ones on the same patch, and faded ones are removed (`gaussians/densify.py`).
+- Surface scores are also split into detailed (refined) and flat blocks, in every run.
+
+```bash
+uv run python scripts/run_gaussians.py --set train.slam_run=<dense BA run> render.depth=plane surface.mode=tied adaptive.enabled=true densify.rounds=2
+```
+
 ## Stages
 
 One git branch per stage. A stage ends with its results table in `outputs/`. The next stage starts only when "done when" is met.

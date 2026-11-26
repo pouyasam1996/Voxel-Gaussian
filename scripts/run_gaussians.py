@@ -43,6 +43,7 @@ gaussians.ply (blob centres with colour), model.pt (blobs + the frames and poses
 surface correction), surface_corrected.ply (learned mode).
 """
 
+import dataclasses
 import random
 import time
 from itertools import pairwise
@@ -67,11 +68,13 @@ from voxel_gaussian.eval.geometry import surface_errors_plane
 from voxel_gaussian.eval.image import depth_scores, psnr, ssim
 from voxel_gaussian.eval.trajectory import align_rigid, ate
 from voxel_gaussian.gaussians.camera import Camera
+from voxel_gaussian.gaussians.densify import colour_error, merge, split_and_prune
 from voxel_gaussian.gaussians.init import from_surface
 from voxel_gaussian.optimization.pose_correction import PoseCorrection
 from voxel_gaussian.optimization.refine import train
 from voxel_gaussian.optimization.shared_surface import SharedSurface
 from voxel_gaussian.slam.tsdf_icp import align
+from voxel_gaussian.tsdf.adaptive import AdaptiveMap, choose_blocks
 from voxel_gaussian.tsdf.surface import extract_points, save_ply
 from voxel_gaussian.tsdf.volume import TSDFVolume
 
@@ -125,18 +128,45 @@ print(
 # ------------------------------------------------------------------ 2. blobs from the map
 t0 = time.time()
 vol = TSDFVolume.from_state(saved["tsdf"], device)
-points, colors, normals = extract_points(vol, cfg.tsdf.min_weight)
+ad = cfg.adaptive
+centres = poses[keyframes][:, :3, 3]
+# the detailed region: refined in adaptive runs, and used to split the surface scores in all runs
+detailed = choose_blocks(vol, cfg.tsdf.min_weight, centres, ad.share, ad.max_distance)
+amap = None
+if ad.enabled:  # the fine level: keyframes fused again, only inside the detailed blocks
+    amap = AdaptiveMap(vol, detailed, ad.fine_factor)
+    K_fuse = seq.intrinsics.scaled(saved["stride"])
+    for p in keyframes:
+        color, depth = seq.read(frames[p], saved["stride"])
+        depth = add_depth_noise(depth, frames[p], cfg.depth_noise)
+        amap.integrate(depth, color.astype(np.float32) / 255.0, poses[p], K_fuse)
+    levels = amap.surfaces(cfg.tsdf.min_weight)
+else:
+    levels = [(*extract_points(vol, cfg.tsdf.min_weight), vol.voxel_size)]
 g = cfg.gaussians
-model = from_surface(
-    points, colors, normals, vol.voxel_size, g.width, g.thickness, g.opacity, g.sh_degree
-).to(device)
+parts = [
+    from_surface(p, c, n, size, g.width, g.thickness, g.opacity, g.sh_degree)
+    for p, c, n, size in levels
+]
+model = merge(parts).to(device) if len(parts) > 1 else parts[0].to(device)
 model.depth_mode = cfg.render.depth
+level = torch.cat([torch.full((len(m.means),), k, device=device) for k, m in enumerate(parts)])
+level_vols = [vol] if amap is None else [amap.coarse, amap.fine]
 surface = None
 if cfg.surface.mode != "free":
-    surface = SharedSurface(vol, model.means.detach(), cfg.surface, cfg.tsdf.min_weight)
+    surface = SharedSurface(
+        level_vols, model.means.detach(), cfg.surface, cfg.tsdf.min_weight, level
+    )
 setup_s = time.time() - t0
+for k, (p, _, _, size) in enumerate(levels):
+    print(
+        f"level {k}: {len(parts[k].means)} blobs from {len(p)} surface points ({size * 100:.1f} cm voxels)"
+    )
+memory_mb = amap.memory_mb() if amap is not None else vol.memory_mb()
 print(
-    f"{len(model.means)} blobs from {len(points)} surface points ({vol.voxel_size * 100:.0f} cm voxels), {setup_s:.1f} s"
+    f"{len(model.means)} blobs, voxel map {memory_mb:.0f} MB"
+    + (f" ({len(detailed)} of the 40 cm blocks refined)" if amap is not None else "")
+    + f", {setup_s:.1f} s"
 )
 if surface is not None:
     st = surface.stats()
@@ -174,10 +204,43 @@ corrections = None
 if cfg.train.poses == "trainable":  # train_pos[0] is the first keyframe: it stays put
     corrections = PoseCorrection(len(train_cams), fixed=(0,)).to(device)
 t0 = time.time()
-history, steps_done = train(
-    model, train_cams, train_images, train_depths, cfg.refine,
-    cfg.refine.anchor_radius * vol.voxel_size, background, budget, corrections, surface,
-)  # fmt: skip
+dn = cfg.densify
+rounds = dn.rounds + 1
+history, steps_done, densified = [], 0, []
+for r in range(rounds):  # without densify: one round of refine.steps
+    part = cfg.refine.steps // rounds + (cfg.refine.steps % rounds if r == rounds - 1 else 0)
+    h, done = train(
+        model, train_cams, train_images, train_depths, dataclasses.replace(cfg.refine, steps=part),
+        cfg.refine.anchor_radius * vol.voxel_size, background, budget, corrections, surface,
+    )  # fmt: skip
+    history += [(steps_done + s, sec, p) for s, sec, p in h]
+    steps_done += done
+    if r == rounds - 1:
+        break
+    t1 = time.time()  # split blobs whose colour is still wrong, remove faded ones
+    with torch.no_grad():
+        positions = surface.means()[0] if surface is not None else model.means.detach()
+    every = max(1, len(train_cams) // dn.views)
+    views = list(range(0, len(train_cams), every))[: dn.views]
+    now = train_cams if corrections is None else corrections.apply(train_cams)
+    cams_v = [now[k] for k in views]
+    err, cover = colour_error(
+        model, cams_v, [train_images[k] for k in views], background, budget,
+        positions if surface is not None else None,
+    )  # fmt: skip
+    model, parent, start, counts = split_and_prune(
+        model, positions, err, cover, dn.share, dn.min_opacity
+    )
+    if surface is not None:
+        surface = surface.regroup(parent, start)
+    level = level[parent]
+    counts["blobs"] = len(model.means)
+    counts["seconds"] = time.time() - t1
+    densified.append(counts)
+    print(
+        f"densify {r + 1}: split {counts['split']}, removed {counts['removed']}, "
+        f"now {counts['blobs']} blobs ({counts['seconds']:.0f} s)"
+    )
 train_s = time.time() - t0
 if surface is not None:  # from here on the blobs are ordinary blobs at their surface positions
     with torch.no_grad():
@@ -231,13 +294,27 @@ if s.score:
     del ref_vol
     opacity = model.values()[4]
     candidates = {
-        "fused": extract_points(vol, t.min_weight)[0],
+        "fused": extract_points(vol, t.min_weight)[0],  # the single-level map
         "blobs": model.means[opacity > 0.1].detach(),
     }
+    if amap is not None:
+        candidates["adaptive"] = torch.cat([x[0] for x in amap.surfaces(t.min_weight)])
     if corrected_vol is not None:
-        candidates["corrected"] = extract_points(corrected_vol, t.min_weight)[0]
+        if amap is None:
+            candidates["corrected"] = extract_points(corrected_vol, t.min_weight)[0]
+        else:
+            both = (corrected_vol, surface.corrected(amap.fine, 1))
+            candidates["corrected"] = torch.cat([x[0] for x in amap.surfaces(t.min_weight, both)])
+    region = AdaptiveMap.__new__(AdaptiveMap)  # only its in_refined(): the detailed blocks
+    region.coarse, region.refined = vol, detailed
     for name, pts in candidates.items():
-        surface_scores[name] = surface_errors_plane(pts.cpu().numpy(), ref_pts, ref_nrm)
+        e = surface_errors_plane(pts.cpu().numpy(), ref_pts, ref_nrm)
+        inside = region.in_refined(pts).cpu().numpy()  # split into detailed and flat blocks
+        for part, sel in (("detailed", inside), ("flat", ~inside)):
+            if sel.any():
+                sub = surface_errors_plane(pts.cpu().numpy()[sel], ref_pts, ref_nrm)
+                e[f"accuracy_{part}_mm"] = sub["accuracy_mm"]
+        surface_scores[name] = e
     surface_scores["reference_points"] = len(ref_pts)
     surface_scores["seconds"] = time.time() - t0
 
@@ -282,6 +359,15 @@ result = {
     "pose_accuracy_before": poses_before,
     "pose_accuracy_after": poses_after,
     "surface_mode": cfg.surface.mode,
+    "voxel_map_mb": memory_mb,
+    "adaptive": None
+    if amap is None
+    else {
+        "refined_blocks": len(detailed),
+        "fine_voxel_cm": amap.fine.voxel_size * 100,
+        "fine_blocks": len(amap.fine.codes),
+    },
+    "densify": densified,
 }
 if surface is not None:
     result["surface"] = surface.stats()
@@ -366,7 +452,8 @@ if surface is not None:
 for name, e in {k: v for k, v in surface_scores.items() if isinstance(v, dict)}.items():
     print(
         f"surface {name:9s} accuracy {e['accuracy_mm']:.2f} mm (median {e['accuracy_median_mm']:.2f}, "
-        f"{e['within_5mm']:.0%} within 5 mm), completeness {e['completeness_mm']:.2f} mm"
+        f"{e['within_5mm']:.0%} within 5 mm; detailed blocks {e.get('accuracy_detailed_mm', 0):.2f}, "
+        f"flat {e.get('accuracy_flat_mm', 0):.2f}), completeness {e['completeness_mm']:.2f} mm"
     )
 for name, a in realigned.items():
     print(
