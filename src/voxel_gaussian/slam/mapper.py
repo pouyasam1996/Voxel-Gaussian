@@ -21,7 +21,8 @@ import numpy as np
 from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import MapConfig, TSDFConfig
 from voxel_gaussian.slam.features import pose_change
-from voxel_gaussian.slam.keyframe import Keyframe, Map
+from voxel_gaussian.slam.keyframe import Map
+from voxel_gaussian.slam.schema import Keyframe
 from voxel_gaussian.slam.tsdf_icp import align
 from voxel_gaussian.tsdf.volume import TSDFVolume
 

@@ -35,7 +35,8 @@ from gtsam.symbol_shorthand import X as pose_key
 
 from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import LocalBAConfig
-from voxel_gaussian.slam.keyframe import Keyframe, Map
+from voxel_gaussian.slam.keyframe import Map
+from voxel_gaussian.slam.schema import Keyframe
 
 FIXED_POSE_NOISE = gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)
 

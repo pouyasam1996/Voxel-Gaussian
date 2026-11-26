@@ -30,7 +30,6 @@ frames.
 """
 
 import time
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -38,7 +37,6 @@ from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import SlamConfig, TSDFConfig
 from voxel_gaussian.slam.dense_odometry import DenseOdometry
 from voxel_gaussian.slam.features import (
-    Features,
     OrbExtractor,
     hamming,
     match,
@@ -46,29 +44,9 @@ from voxel_gaussian.slam.features import (
     refine_pose_with_depth,
     solve_pnp,
 )
-from voxel_gaussian.slam.keyframe import Keyframe, Map
+from voxel_gaussian.slam.keyframe import Map
 from voxel_gaussian.slam.mapper import Mapper
-
-
-@dataclass
-class FrameRecord:
-    """One frame's result: its pose relative to a keyframe, and how it was tracked."""
-
-    keyframe_id: int  # keyframe the pose is stored against
-    camera_to_keyframe: np.ndarray  # pose relative to that keyframe
-    status: str  # init, pnp, dense, promoted, reloc, lost
-
-
-@dataclass
-class Candidate:
-    """A successfully tracked frame (also the material for a new keyframe)."""
-
-    index: int
-    camera_to_world: np.ndarray
-    features: Features
-    color: np.ndarray
-    depth: np.ndarray
-    matched_points: list  # (feature index, map point id) inliers of the pose solve
+from voxel_gaussian.slam.schema import Candidate, Features, FrameRecord, Keyframe
 
 
 class Tracker:

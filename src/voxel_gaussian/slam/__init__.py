@@ -7,6 +7,7 @@ tracker.py    per-frame tracking, fallbacks, keyframe decisions, map building (s
 local_ba.py   local bundle adjustment with GTSAM (step 2)
 mapper.py     voxel map from settled keyframes; re-fusion of moved ones; blocks per keyframe
 tsdf_icp.py   align a depth image to the voxel map (ICP through the lookup)
+schema.py     the data records: Features, Keyframe, MapPoint, FrameRecord, Candidate
 
 icp.py                  camera onto the TSDF (brute force in Stage 1, fast lookup in Stage 3)
 pose_graph.py           drift correction / loop closure                 (Stage 9)

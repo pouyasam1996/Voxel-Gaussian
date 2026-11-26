@@ -4,29 +4,12 @@ A feature is a distinctive spot (a corner) with a 256-bit descriptor of its surr
 two descriptors are compared by counting differing bits (Hamming distance).
 """
 
-from dataclasses import dataclass
-
 import cv2
 import numpy as np
 
 from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import OrbOdometryConfig
-
-
-@dataclass
-class Features:
-    """ORB features of one image: pixel positions, pyramid levels, descriptors, depth."""
-
-    pixels: np.ndarray  # (N, 2) pixel positions (x, y)
-    pyramid_level: np.ndarray  # (N,) level where found; pixel noise grows by scale^level
-    descriptors: np.ndarray  # (N, 32) uint8 descriptors
-    depth: np.ndarray  # (N,) metres; 0 = no usable depth
-
-    def subset(self, keep: np.ndarray) -> "Features":
-        """The features selected by `keep` (boolean mask or indices)."""
-        return Features(
-            self.pixels[keep], self.pyramid_level[keep], self.descriptors[keep], self.depth[keep]
-        )
+from voxel_gaussian.slam.schema import Features
 
 
 class OrbExtractor:

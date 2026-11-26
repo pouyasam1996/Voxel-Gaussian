@@ -34,144 +34,190 @@ from voxel_gaussian.slam.tracker import Tracker
 from voxel_gaussian.tsdf.surface import extract_points, save_ply
 from voxel_gaussian.tsdf.volume import TSDFVolume
 
-args = config_parser(__doc__).parse_args()
-cfg = config_from_args(args)
-run_dir = start_run(cfg, args.experiment, args.set)
-s = cfg.slam
+arguments = config_parser(__doc__).parse_args()
+config = config_from_args(arguments)
+run_folder = start_run(config, arguments.experiment, arguments.set)
+slam_config = config.slam
 
-seq = load_sequence(cfg.dataset, data_root() / cfg.dataset.path)
-stride = max(1, math.ceil(cfg.dataset.width / s.max_width))
-K = seq.intrinsics.scaled(stride)
-frames = list(range(0, len(seq), s.frame_step))[: s.max_frames]
-gt = seq.gt_poses[frames]
-stamps = seq.timestamps[frames]
-save_tum(run_dir / "gt.txt", stamps, gt)
-name = "slam_ba" if s.ba.enabled else "slam_kf"  # with bundle adjustment / keyframes only
+# ------------------------------------------------------------------ input frames
+
+image_sequence = load_sequence(config.dataset, data_root() / config.dataset.path)
+# Images are shrunk by this whole factor (every n-th pixel) to at most slam.max_width wide.
+image_downscale = max(1, math.ceil(config.dataset.width / slam_config.max_width))
+intrinsics = image_sequence.intrinsics.scaled(image_downscale)
+# Dataset frame numbers used in this run; a frame's position in this list is its SLAM index.
+frame_numbers = list(range(0, len(image_sequence), slam_config.frame_step))[
+    : slam_config.max_frames
+]
+true_poses = image_sequence.gt_poses[frame_numbers]
+timestamps = image_sequence.timestamps[frame_numbers]
+save_tum(run_folder / "gt.txt", timestamps, true_poses)
+# with bundle adjustment / keyframes only
+method_name = "slam_ba" if slam_config.ba.enabled else "slam_kf"
 print(
-    f"{cfg.dataset.name}: {len(frames)} frames, {K.width}x{K.height} px, "
-    f"true path {path_length_m(gt):.2f} m, {name} -> {run_dir}"
+    f"{config.dataset.name}: {len(frame_numbers)} frames, "
+    f"{intrinsics.width}x{intrinsics.height} px, "
+    f"true path {path_length_m(true_poses):.2f} m, {method_name} -> {run_folder}"
 )
 
+# ------------------------------------------------------------------ tracking
+
 device = get_device()
-tracker = Tracker(K, s, cfg.tsdf, device)
-frame_ms = []  # frames that did not create a keyframe
-for k, i in enumerate(frames):
-    color, depth = seq.read(i, stride)
-    t0 = time.perf_counter()
+tracker = Tracker(intrinsics, slam_config, config.tsdf, device)
+tracking_ms_per_frame = []  # only frames that did not create a keyframe
+for frame_index, frame_number in enumerate(frame_numbers):
+    color, depth = image_sequence.read(frame_number, image_downscale)
+    start_time = time.perf_counter()
     status = tracker.process(color, depth)
     if "kf" not in status and status != "init":
-        frame_ms.append((time.perf_counter() - t0) * 1000)
-    if k % 200 == 0 and k:
-        lost = sum(f.status == "lost" for f in tracker.frames)
+        tracking_ms_per_frame.append((time.perf_counter() - start_time) * 1000)
+    if frame_index % 200 == 0 and frame_index:
+        lost_frames = sum(record.status == "lost" for record in tracker.frames)
         print(
-            f"  frame {k}/{len(frames)}: {len(tracker.map.keyframes)} keyframes, "
-            f"{len(tracker.map.points)} points, {lost} lost, "
-            f"{np.median(frame_ms or [np.nan]):.1f} ms/frame, "
+            f"  frame {frame_index}/{len(frame_numbers)}: "
+            f"{len(tracker.map.keyframes)} keyframes, "
+            f"{len(tracker.map.points)} points, {lost_frames} lost, "
+            f"{np.median(tracking_ms_per_frame or [np.nan]):.1f} ms/frame, "
             f"{np.median(tracker.keyframe_ms):.0f} ms/keyframe"
         )
 
 tracker.finish()  # fuse the keyframes still being optimized at the end
-est = tracker.poses()
-kf_frames, kf_poses = tracker.keyframe_poses()
-save_tum(run_dir / "slam.txt", stamps, est)
-save_tum(run_dir / "keyframes.txt", stamps[kf_frames], kf_poses)
-a, r, a_kf = ate(est, gt), rpe(est, gt), ate(kf_poses, gt[kf_frames])
 
-statuses = Counter(f.status for f in tracker.frames)
-ba = [b for b in tracker.bundle_adjustment_stats if b]
+# ------------------------------------------------------------------ trajectory accuracy
+
+estimated_poses = tracker.poses()
+keyframe_indices, keyframe_poses = tracker.keyframe_poses()  # indices into frame_numbers
+save_tum(run_folder / "slam.txt", timestamps, estimated_poses)
+save_tum(run_folder / "keyframes.txt", timestamps[keyframe_indices], keyframe_poses)
+absolute_error = ate(estimated_poses, true_poses)
+relative_error = rpe(estimated_poses, true_poses)
+keyframe_absolute_error = ate(keyframe_poses, true_poses[keyframe_indices])
+
+status_counts = Counter(record.status for record in tracker.frames)
+bundle_adjustment_runs = [stats for stats in tracker.bundle_adjustment_stats if stats]
 result = {
-    "frames": len(frames),
-    "keyframes": len(kf_frames),
+    "frames": len(frame_numbers),
+    "keyframes": len(keyframe_indices),
     "points": len(tracker.map.points),
-    "lost": statuses.get("lost", 0),
-    "status": dict(statuses),
-    "ate_rmse_cm": a["rmse_cm"],
-    "ate_max_cm": a["max_cm"],
-    "kf_ate_rmse_cm": a_kf["rmse_cm"],
-    "rpe_trans_cm": r["trans_rmse_cm"],
-    "rpe_rot_deg": r["rot_rmse_deg"],
-    "frame_ms_median": float(np.median(frame_ms)) if frame_ms else float("nan"),
+    "lost": status_counts.get("lost", 0),
+    "status": dict(status_counts),
+    "ate_rmse_cm": absolute_error["rmse_cm"],
+    "ate_max_cm": absolute_error["max_cm"],
+    "kf_ate_rmse_cm": keyframe_absolute_error["rmse_cm"],
+    "rpe_trans_cm": relative_error["trans_rmse_cm"],
+    "rpe_rot_deg": relative_error["rot_rmse_deg"],
+    "frame_ms_median": float(np.median(tracking_ms_per_frame))
+    if tracking_ms_per_frame
+    else float("nan"),
     "keyframe_ms_median": float(np.median(tracker.keyframe_ms)),
     "dense_links_ok_failed": list(tracker.dense_links),
 }
-if s.ba.enabled and s.reuse.enabled:  # coming back to mapped areas
-    ru = tracker.reuse
+if slam_config.ba.enabled and slam_config.reuse.enabled:  # coming back to mapped areas
+    reuse_stats = tracker.reuse
     result["reuse"] = {
-        "tried": ru["tried"],
-        "accepted": ru["accepted"],
-        "merged_points": ru["merged"],
-        "correction_cm_median": float(np.median(ru["correction_cm"]))
-        if ru["correction_cm"]
+        "tried": reuse_stats["tried"],
+        "accepted": reuse_stats["accepted"],
+        "merged_points": reuse_stats["merged"],
+        "correction_cm_median": float(np.median(reuse_stats["correction_cm"]))
+        if reuse_stats["correction_cm"]
         else 0.0,
     }
-if ba:
+if bundle_adjustment_runs:
     result["ba"] = {
-        "ms_median": float(np.median([b["ms"] for b in ba])),
-        "window_mean": float(np.mean([b["window"] for b in ba])),
-        "points_mean": float(np.mean([b["points"] for b in ba])),
-        "removed_sightings": int(sum(b["removed"] for b in ba)),
+        "ms_median": float(np.median([run["ms"] for run in bundle_adjustment_runs])),
+        "window_mean": float(np.mean([run["window"] for run in bundle_adjustment_runs])),
+        "points_mean": float(np.mean([run["points"] for run in bundle_adjustment_runs])),
+        "removed_sightings": int(sum(run["removed"] for run in bundle_adjustment_runs)),
         # weighted error of the dense links after optimization: ~6 if dense_link_sigma is right
-        "link_chi2_mean": float(np.nanmean([b["link_chi2"] for b in ba])),
+        "link_chi2_mean": float(np.nanmean([run["link_chi2"] for run in bundle_adjustment_runs])),
     }
 
+# ------------------------------------------------------------------ voxel map
+
 if tracker.mapper is not None:
-    mapper, t = tracker.mapper, cfg.tsdf
-    pts, cols, normals = extract_points(mapper.volume, t.min_weight)
-    save_ply(run_dir / "surface.ply", pts, cols, normals)
+    mapper, tsdf_config = tracker.mapper, config.tsdf
+    surface_points, surface_colors, surface_normals = extract_points(
+        mapper.volume, tsdf_config.min_weight
+    )
+    save_ply(run_folder / "surface.ply", surface_points, surface_colors, surface_normals)
     # Reference: the same keyframe images fused with their TRUE poses. Comparing with it
     # measures only what pose errors do to the surface (same images, same voxel size).
-    ref = TSDFVolume(t.voxel, t.block, t.trunc_voxels, t.depth_max, device)
-    for kf in tracker.map.keyframes:
-        ref.integrate(kf.depth, kf.color.astype(np.float32) / 255.0, gt[kf.frame], K)
-    ref_pts, ref_cols, ref_normals = extract_points(ref, t.min_weight)
-    save_ply(run_dir / "surface_true_poses.ply", ref_pts, ref_cols, ref_normals)
+    reference_volume = TSDFVolume(
+        tsdf_config.voxel, tsdf_config.block, tsdf_config.trunc_voxels,
+        tsdf_config.depth_max, device,
+    )  # fmt: skip
+    for keyframe in tracker.map.keyframes:
+        reference_volume.integrate(
+            keyframe.depth,
+            keyframe.color.astype(np.float32) / 255.0,
+            true_poses[keyframe.frame],
+            intrinsics,
+        )
+    reference_points, reference_colors, reference_normals = extract_points(
+        reference_volume, tsdf_config.min_weight
+    )
+    save_ply(
+        run_folder / "surface_true_poses.ply", reference_points, reference_colors, reference_normals
+    )
     # The map and poses for the Gaussians (scripts/run_gaussians.py). Positions in `frames`
     # (this run's frame list) index `poses`; frames[k] is the dataset frame number.
     torch.save(
         {
             "tsdf": mapper.volume.state(),
-            "frames": list(frames),
-            "poses": torch.from_numpy(est),
-            "keyframes": list(kf_frames),
-            "stride": stride,
+            "frames": list(frame_numbers),
+            "poses": torch.from_numpy(estimated_poses),
+            "keyframes": list(keyframe_indices),
+            "stride": image_downscale,
         },
-        run_dir / "map.pt",
+        run_folder / "map.pt",
     )
     # our map is in SLAM's frame (frame 0 = origin): move it like the ATE alignment does
-    R, shift = align_rigid(kf_poses[:, :3, 3], gt[kf_frames][:, :3, 3])
-    surface = surface_errors(pts.cpu().numpy() @ R.T + shift, ref_pts.cpu().numpy())
-    icp = mapper.stats["icp"]
+    rotation, translation = align_rigid(
+        keyframe_poses[:, :3, 3], true_poses[keyframe_indices][:, :3, 3]
+    )
+    surface_accuracy = surface_errors(
+        surface_points.cpu().numpy() @ rotation.T + translation, reference_points.cpu().numpy()
+    )
+    icp_counts = mapper.stats["icp"]
     result["map"] = {
-        **surface,
+        **surface_accuracy,
         "memory_mb": mapper.volume.memory_mb(),
         "fused": mapper.stats["fused"],
         "refused_after_move": mapper.stats["refused"],
         "fuse_ms_median": float(np.median(mapper.stats["fuse_ms"])),
-        "icp_tried": icp["tried"],
-        "icp_accepted": icp["accepted"],
-        "icp_low_overlap": icp["low_overlap"],
-        "icp_too_large": icp["too_large"],
-        "icp_dropped_by_ba": int(sum(b.get("map_dropped", 0) for b in ba)),
+        "icp_tried": icp_counts["tried"],
+        "icp_accepted": icp_counts["accepted"],
+        "icp_low_overlap": icp_counts["low_overlap"],
+        "icp_too_large": icp_counts["too_large"],
+        "icp_dropped_by_ba": int(sum(run.get("map_dropped", 0) for run in bundle_adjustment_runs)),
         "icp_correction_cm_median": float(np.median(mapper.icp_correction_cm or [0.0])),
         "icp_rms_mm_median": float(np.median(mapper.icp_rms_mm or [0.0])),
     }
 
-with open(run_dir / "results.yaml", "w") as f:
-    yaml.safe_dump({name: result}, f, sort_keys=False)
+# ------------------------------------------------------------------ report
+
+with open(run_folder / "results.yaml", "w") as results_file:
+    yaml.safe_dump({method_name: result}, results_file, sort_keys=False)
 plot_trajectories(
-    run_dir / "trajectories.png", gt[:, :3, 3], {name: a["aligned_xyz"]}, {name: a["errors_cm"]}
+    run_folder / "trajectories.png",
+    true_poses[:, :3, 3],
+    {method_name: absolute_error["aligned_xyz"]},
+    {method_name: absolute_error["errors_cm"]},
 )
 print_table(
-    {name: result},
+    {method_name: result},
     ["keyframes", "lost", "ate_rmse_cm", "kf_ate_rmse_cm", "rpe_rot_deg", "frame_ms_median"],
 )
 print(f"keyframe_ms_median {result['keyframe_ms_median']:.0f}")
-if ba:
+if bundle_adjustment_runs:
     print("bundle adjustment:", result["ba"])
 if "reuse" in result:
     print("map reuse:", result["reuse"])
 if "map" in result:
     print(
         "voxel map:",
-        {k: round(v, 3) if isinstance(v, float) else v for k, v in result["map"].items()},
+        {
+            key: round(value, 3) if isinstance(value, float) else value
+            for key, value in result["map"].items()
+        },
     )

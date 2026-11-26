@@ -1,43 +1,13 @@
 """The map: keyframes, map points, and the dense links between consecutive keyframes.
 
-Keyframe   a frame kept as a fixed reference: its pose (camera -> world, moved by bundle
-           adjustment), its ORB features with usable depth, and an RGB-D image for dense
-           alignment. Ordinary frames store their pose relative to a keyframe, so when bundle
-           adjustment moves the keyframe, its frames move with it.
-Map point  one physical 3D point, seen by several keyframes: its world position and, for each
-           keyframe that saw it, which feature. Shared points are what bundle adjustment needs.
-Link       dense alignment between two consecutive keyframes: their relative pose and Open3D's
-           6x6 information matrix (which directions the alignment pinned down).
+Keyframes and map points are defined in schema.py.
+Link  dense alignment between two consecutive keyframes: their relative pose and Open3D's
+      6x6 information matrix (which directions the alignment pinned down).
 """
-
-from dataclasses import dataclass, field
 
 import numpy as np
 
-from voxel_gaussian.slam.features import Features
-
-
-@dataclass
-class Keyframe:
-    """A frame kept as a fixed reference: pose, features with depth, their map points, RGB-D."""
-
-    id: int
-    frame: int  # position in the run's frame list
-    camera_to_world: np.ndarray  # (4, 4) pose
-    features: Features  # only features with usable depth
-    point_ids: np.ndarray  # (N,) map point of each feature, -1 = none
-    rgbd: object  # Open3D RGB-D image
-    reference_inliers: int = 0  # inliers of the first frame tracked against it (keyframe rule)
-    color: np.ndarray | None = None  # (H, W, 3) uint8, kept for fusing into the voxel map
-    depth: np.ndarray | None = None  # (H, W) metres
-
-
-@dataclass
-class MapPoint:
-    """One physical 3D point: world position and which feature of each keyframe saw it."""
-
-    position: np.ndarray  # world position
-    sightings: dict[int, int] = field(default_factory=dict)  # keyframe id -> feature index
+from voxel_gaussian.slam.schema import Keyframe, MapPoint
 
 
 class Map:
