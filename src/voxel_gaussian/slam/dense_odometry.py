@@ -22,11 +22,12 @@ import open3d as o3d
 
 from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import DenseOdometryConfig
+from voxel_gaussian.slam.schema import DenseOdometryMethod
 
 odometry = o3d.pipelines.odometry
 JACOBIANS = {
-    "hybrid": odometry.RGBDOdometryJacobianFromHybridTerm,  # depth + brightness
-    "intensity": odometry.RGBDOdometryJacobianFromColorTerm,  # brightness only
+    DenseOdometryMethod.HYBRID: odometry.RGBDOdometryJacobianFromHybridTerm,
+    DenseOdometryMethod.INTENSITY: odometry.RGBDOdometryJacobianFromColorTerm,
 }
 
 
@@ -38,7 +39,8 @@ class DenseOdometry:
             intrinsics.width, intrinsics.height,
             intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
         )  # fmt: skip
-        self.jacobian = JACOBIANS[config.method]()
+        # an unknown method in the YAML stops here with a ValueError naming it
+        self.jacobian = JACOBIANS[DenseOdometryMethod(config.method)]()
         self.option = odometry.OdometryOption(
             o3d.utility.IntVector(config.iterations), config.depth_outlier_trunc, 0.0, depth_max
         )

@@ -46,7 +46,13 @@ from voxel_gaussian.slam.features import (
 )
 from voxel_gaussian.slam.keyframe import Map
 from voxel_gaussian.slam.mapper import Mapper
-from voxel_gaussian.slam.schema import Candidate, Features, FrameRecord, Keyframe
+from voxel_gaussian.slam.schema import (
+    Candidate,
+    Features,
+    FrameRecord,
+    Keyframe,
+    TrackingStatus,
+)
 
 
 class Tracker:
@@ -99,27 +105,27 @@ class Tracker:
 
     # ------------------------------------------------------------------ per frame
 
-    def process(self, color: np.ndarray, depth: np.ndarray) -> str:
-        """Track one RGB-D frame and make it a keyframe if needed; returns its status.
+    def process(self, color: np.ndarray, depth: np.ndarray) -> tuple[TrackingStatus, bool]:
+        """Track one RGB-D frame and make it a keyframe if needed.
 
-        Status: init, pnp, dense, promoted, reloc or lost, with "+kf" when it became a keyframe.
+        Returns (how its pose was found, whether it became a keyframe).
         """
         frame_index = len(self.frames)
         features = self.extract_features(color, depth)
         if self.current_keyframe is None:
             self._new_keyframe(Candidate(frame_index, np.eye(4), features, color, depth, []))
-            self._record(np.eye(4), "init")
-            return "init"
+            self._record(np.eye(4), TrackingStatus.INIT)
+            return TrackingStatus.INIT, True
 
         previous_pose = self._pose(frame_index - 1)
         predicted_pose = previous_pose @ self.velocity
         camera_to_world, matched_points, inliers = self._track_pnp(
             self.current_keyframe, features, predicted_pose
         )
-        status = "pnp"
+        status = TrackingStatus.PNP
         if camera_to_world is None:
             camera_to_world = self._track_dense(color, depth, predicted_pose)
-            status = "dense"
+            status = TrackingStatus.DENSE
         last = self.last_tracked
         if (
             camera_to_world is None
@@ -139,26 +145,27 @@ class Tracker:
             camera_to_world, matched_points, inliers = self._track_pnp(
                 self.current_keyframe, features, predicted_pose
             )
-            status = "promoted"
+            status = TrackingStatus.PROMOTED
         if camera_to_world is None:
             camera_to_world, matched_points, inliers = self._relocalize(features)
-            status = "reloc"
+            status = TrackingStatus.RELOCALIZED
         if camera_to_world is None:
-            self._record(predicted_pose, "lost")
+            self._record(predicted_pose, TrackingStatus.LOST)
             self.lost_streak += 1
-            return "lost"
+            return TrackingStatus.LOST, False
         self.lost_streak, self.last_good_pose = 0, camera_to_world
 
         # after relocalizing, the jump back into the map is not a motion to repeat
-        if status == "reloc":
+        if status == TrackingStatus.RELOCALIZED:
             self.velocity = np.eye(4)
         else:
             self.velocity = np.linalg.inv(previous_pose) @ camera_to_world
-        if status in ("pnp", "promoted") and self.current_keyframe.reference_inliers == 0:
+        matched_features = status in (TrackingStatus.PNP, TrackingStatus.PROMOTED)
+        if matched_features and self.current_keyframe.reference_inliers == 0:
             self.current_keyframe.reference_inliers = inliers
         candidate = Candidate(
             frame_index, camera_to_world, features, color, depth,
-            matched_points if status != "dense" else [],
+            matched_points if status != TrackingStatus.DENSE else [],
         )  # fmt: skip
         self._record(camera_to_world, status)
         if self._needs_keyframe(candidate, status, inliers):
@@ -168,9 +175,9 @@ class Tracker:
             keyframe_pose = self.current_keyframe.camera_to_world
             self.velocity = np.linalg.inv(self._pose(frame_index - 1)) @ keyframe_pose
             self.last_good_pose = keyframe_pose
-            return status + "+kf"
+            return status, True
         self.last_tracked = candidate
-        return status
+        return status, False
 
     def _promote(self, candidate: Candidate) -> None:
         """Make an already recorded frame a keyframe; its record then points to it."""
@@ -184,7 +191,7 @@ class Tracker:
         keyframe = self.map.keyframes[record.keyframe_id]
         return keyframe.camera_to_world @ record.camera_to_keyframe
 
-    def _record(self, camera_to_world: np.ndarray, status: str) -> None:
+    def _record(self, camera_to_world: np.ndarray, status: TrackingStatus) -> None:
         """Store the next frame's pose relative to the current keyframe."""
         keyframe = self.current_keyframe
         camera_to_keyframe = np.linalg.inv(keyframe.camera_to_world) @ camera_to_world
@@ -277,12 +284,13 @@ class Tracker:
             self.current_keyframe = best_keyframe
         return best_pose, best_matches, best_inliers
 
-    def _needs_keyframe(self, candidate: Candidate, status: str, inliers: int) -> bool:
+    def _needs_keyframe(self, candidate: Candidate, status: TrackingStatus, inliers: int) -> bool:
         """True if the tracked frame should become the next keyframe."""
         keyframe, rules = self.current_keyframe, self.tracker_config
         distance, angle = pose_change(keyframe.camera_to_world, candidate.camera_to_world)
         return (
-            status in ("dense", "reloc")  # features weak or just relocalized: refresh
+            # features weak or just relocalized: refresh
+            status in (TrackingStatus.DENSE, TrackingStatus.RELOCALIZED)
             or inliers < rules.keyframe_min_inlier_ratio * keyframe.reference_inliers
             or distance > rules.keyframe_max_translation
             or angle > rules.keyframe_max_rotation_deg

@@ -1,7 +1,10 @@
 """The data records SLAM passes around: features, keyframes, map points, tracked frames.
 
-Plain dataclasses only, no algorithms, so every SLAM module can import them without
-importing each other.
+Plain dataclasses and enums only, no algorithms, so every SLAM module can import them
+without importing each other.
+
+TrackingStatus       how a frame's pose was found (or that it was lost).
+DenseOdometryMethod  which residuals dense alignment uses (slam.dense.method in the YAML).
 
 Features     ORB features of one image (features.py extracts them).
 Keyframe     a frame kept as a fixed reference: its pose (camera -> world, moved by bundle
@@ -16,8 +19,27 @@ Candidate    a successfully tracked frame, kept in case it becomes the next keyf
 """
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 import numpy as np
+
+
+class TrackingStatus(StrEnum):
+    """How the tracker found a frame's pose. The values are what results.yaml reports."""
+
+    INIT = "init"  # first frame: the origin
+    PNP = "pnp"  # features matched with the current keyframe's map points
+    DENSE = "dense"  # dense alignment with the current keyframe (features failed)
+    PROMOTED = "promoted"  # the last good frame became a keyframe, then features matched
+    RELOCALIZED = "reloc"  # matched against all keyframes after the others failed
+    LOST = "lost"  # nothing worked: the predicted pose is kept
+
+
+class DenseOdometryMethod(StrEnum):
+    """Which residuals dense alignment minimizes (slam.dense.method in the YAML)."""
+
+    HYBRID = "hybrid"  # depth + brightness
+    INTENSITY = "intensity"  # brightness only
 
 
 @dataclass
@@ -65,7 +87,7 @@ class FrameRecord:
 
     keyframe_id: int  # keyframe the pose is stored against
     camera_to_keyframe: np.ndarray  # pose relative to that keyframe
-    status: str  # init, pnp, dense, promoted, reloc, lost
+    status: TrackingStatus
 
 
 @dataclass

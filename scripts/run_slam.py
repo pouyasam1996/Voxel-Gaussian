@@ -30,6 +30,7 @@ from voxel_gaussian.datasets.sequence import load_sequence
 from voxel_gaussian.eval.geometry import surface_errors
 from voxel_gaussian.eval.report import plot_trajectories, print_table
 from voxel_gaussian.eval.trajectory import align_rigid, ate, path_length_m, rpe, save_tum
+from voxel_gaussian.slam.schema import TrackingStatus
 from voxel_gaussian.slam.tracker import Tracker
 from voxel_gaussian.tsdf.surface import extract_points, save_ply
 from voxel_gaussian.tsdf.volume import TSDFVolume
@@ -68,11 +69,11 @@ tracking_ms_per_frame = []  # only frames that did not create a keyframe
 for frame_index, frame_number in enumerate(frame_numbers):
     color, depth = image_sequence.read(frame_number, image_downscale)
     start_time = time.perf_counter()
-    status = tracker.process(color, depth)
-    if "kf" not in status and status != "init":
+    _, became_keyframe = tracker.process(color, depth)
+    if not became_keyframe:  # the first frame always becomes a keyframe
         tracking_ms_per_frame.append((time.perf_counter() - start_time) * 1000)
     if frame_index % 200 == 0 and frame_index:
-        lost_frames = sum(record.status == "lost" for record in tracker.frames)
+        lost_frames = sum(record.status == TrackingStatus.LOST for record in tracker.frames)
         print(
             f"  frame {frame_index}/{len(frame_numbers)}: "
             f"{len(tracker.map.keyframes)} keyframes, "
@@ -93,13 +94,14 @@ absolute_error = ate(estimated_poses, true_poses)
 relative_error = rpe(estimated_poses, true_poses)
 keyframe_absolute_error = ate(keyframe_poses, true_poses[keyframe_indices])
 
-status_counts = Counter(record.status for record in tracker.frames)
+# plain strings as keys: yaml.safe_dump cannot write enum members
+status_counts = Counter(record.status.value for record in tracker.frames)
 bundle_adjustment_runs = [stats for stats in tracker.bundle_adjustment_stats if stats]
 result = {
     "frames": len(frame_numbers),
     "keyframes": len(keyframe_indices),
     "points": len(tracker.map.points),
-    "lost": status_counts.get("lost", 0),
+    "lost": status_counts.get(TrackingStatus.LOST.value, 0),
     "status": dict(status_counts),
     "ate_rmse_cm": absolute_error["rmse_cm"],
     "ate_max_cm": absolute_error["max_cm"],
