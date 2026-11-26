@@ -66,11 +66,15 @@ class Tracker:
         device="cpu",
     ):
         self.intrinsics, self.config, self.tracker_config = intrinsics, config, config.tracker
+
+        # --- The building blocks
         self.extract_features = OrbExtractor(
             config.orb, config.depth_max, config.tracker.edge_depth_ratio
         )
         self.dense_odometry = DenseOdometry(intrinsics, config.dense, config.depth_max)
-        self.map = Map()
+        self.map = Map()  # keyframes, map points, dense links between keyframes
+        # Optional parts, each switched on in the YAML: bundle adjustment corrects keyframe
+        # poses and points; the mapper builds the voxel map and aligns new keyframes to it.
         self.bundle_adjustment = None
         if config.ba.enabled:
             from voxel_gaussian.slam.local_ba import LocalBA  # needs gtsam
@@ -79,21 +83,28 @@ class Tracker:
         self.mapper = (
             Mapper(intrinsics, tsdf, config.map, device) if config.map.enabled and tsdf else None
         )
-        self.frames: list[FrameRecord] = []
+
+        # --- Tracking state, updated by every frame
+        self.frames: list[FrameRecord] = []  # result of every frame so far, in order
         self.current_keyframe: Keyframe | None = None  # reference for tracking new frames
         self.last_tracked: Candidate | None = None  # last well-tracked frame
-        self.velocity = np.eye(4)  # last frame-to-frame motion (camera frame)
-        self.bundle_adjustment_stats: list[dict] = []
-        self.keyframe_ms: list[float] = []
-        self.dense_links = [0, 0]  # succeeded, failed
+        # camera motion over the last frame (4x4 transform), assumed to repeat for the next
+        self.previous_to_current_motion = np.eye(4)
         self.last_good_pose: np.ndarray | None = None  # pose of the last tracked frame
-        self.lost_streak = 0
+        self.lost_streak = 0  # consecutive lost frames
+
+        # --- Statistics for the run report (results.yaml)
+        self.bundle_adjustment_stats: list[dict] = []  # one entry per optimization
+        self.keyframe_ms: list[float] = []  # time spent making each keyframe
+        self.dense_links = [0, 0]  # keyframe-to-keyframe dense links: succeeded, failed
         self.reuse = {"tried": 0, "accepted": 0, "merged": 0, "correction_cm": []}
 
     # ------------------------------------------------------------------ results
 
     def poses(self) -> np.ndarray:
         """(N, 4, 4) camera -> world pose of every frame, with the latest keyframe poses."""
+        # Computed now, not stored: bundle adjustment may have moved the keyframes since the
+        # frames were tracked, and each frame follows its keyframe.
         return np.stack([self._pose(frame_index) for frame_index in range(len(self.frames))])
 
     def keyframe_poses(self) -> tuple[list[int], np.ndarray]:
@@ -109,80 +120,123 @@ class Tracker:
         """Track one RGB-D frame and make it a keyframe if needed.
 
         Returns (how its pose was found, whether it became a keyframe).
+
+        Tries the cheapest way to find the pose first and falls back only when it fails:
+        features vs. the current keyframe -> dense alignment -> promote the last good frame
+        to keyframe and retry features -> relocalize against every keyframe -> lost.
         """
-        frame_index = len(self.frames)
+        frame_index = len(self.frames)  # this frame's position in the run
         features = self.extract_features(color, depth)
+
+        # --- First frame: it defines the world origin and becomes keyframe 0.
         if self.current_keyframe is None:
             self._new_keyframe(Candidate(frame_index, np.eye(4), features, color, depth, []))
             self._record(np.eye(4), TrackingStatus.INIT)
             return TrackingStatus.INIT, True
 
+        # --- Predict: assume the camera repeats its last frame-to-frame motion.
+        # The prediction seeds the pose solvers and rejects implausible jumps.
         previous_pose = self._pose(frame_index - 1)
-        predicted_pose = previous_pose @ self.velocity
+        predicted_pose = previous_pose @ self.previous_to_current_motion
+
+        # --- Attempt 1: match ORB features with the current keyframe's map points (PnP).
         camera_to_world, matched_points, inliers = self._track_pnp(
             self.current_keyframe, features, predicted_pose
         )
         status = TrackingStatus.PNP
+
+        # --- Attempt 2: dense alignment of the whole image with the current keyframe.
+        # It gives a pose but no feature matches: matched_points and inliers keep the
+        # empty values of the failed attempt 1.
         if camera_to_world is None:
             camera_to_world = self._track_dense(color, depth, predicted_pose)
             status = TrackingStatus.DENSE
+
+        # --- Attempt 3: the current keyframe has probably drifted out of view.
+        # Make the last well-tracked frame a keyframe (it sees what this frame sees) and
+        # match features against it. Skipped if that frame already is the keyframe.
         last = self.last_tracked
         if (
             camera_to_world is None
             and last is not None
             and last.index != self.current_keyframe.frame
         ):
-            # the keyframe drifted out of view: make the last good frame a keyframe, retry.
-            # Its pose may change (dense link, bundle adjustment): move the prediction with it.
             pose_when_tracked = last.camera_to_world
             self._promote(last)
+            # Turning it into a keyframe can move its pose (dense link, bundle adjustment);
+            # move the prediction by the same correction so it stays consistent.
             predicted_pose = (
                 self.current_keyframe.camera_to_world
                 @ np.linalg.inv(pose_when_tracked)
                 @ predicted_pose
             )
+            # the previous frame's pose may have moved with it too
             previous_pose = self._pose(frame_index - 1)
             camera_to_world, matched_points, inliers = self._track_pnp(
                 self.current_keyframe, features, predicted_pose
             )
             status = TrackingStatus.PROMOTED
+
+        # --- Attempt 4: relocalize. Try every keyframe without a prediction; if one
+        # works, it becomes the current keyframe.
         if camera_to_world is None:
             camera_to_world, matched_points, inliers = self._relocalize(features)
             status = TrackingStatus.RELOCALIZED
+
+        # --- Everything failed: keep the predicted pose so the trajectory has no gap,
+        # and count how long we have been lost (relocalization searches wider after a while).
         if camera_to_world is None:
             self._record(predicted_pose, TrackingStatus.LOST)
             self.lost_streak += 1
             return TrackingStatus.LOST, False
+
+        # --- Success: update the state used to track the next frame.
         self.lost_streak, self.last_good_pose = 0, camera_to_world
 
-        # after relocalizing, the jump back into the map is not a motion to repeat
+        # Motion to repeat for the next prediction. After relocalizing, the jump back onto
+        # the map is a correction, not a real camera motion, so assume standing still.
         if status == TrackingStatus.RELOCALIZED:
-            self.velocity = np.eye(4)
+            self.previous_to_current_motion = np.eye(4)
         else:
-            self.velocity = np.linalg.inv(previous_pose) @ camera_to_world
+            self.previous_to_current_motion = np.linalg.inv(previous_pose) @ camera_to_world
+
+        # The first feature-matched frame of a keyframe sets its reference inlier count;
+        # a new keyframe is made once later frames match clearly fewer points.
         matched_features = status in (TrackingStatus.PNP, TrackingStatus.PROMOTED)
         if matched_features and self.current_keyframe.reference_inliers == 0:
             self.current_keyframe.reference_inliers = inliers
+
+        # Keep the frame (with its feature-to-map-point matches) in case it becomes a
+        # keyframe now, or is promoted later by attempt 3. Dense tracking has no matches.
         candidate = Candidate(
             frame_index, camera_to_world, features, color, depth,
             matched_points if status != TrackingStatus.DENSE else [],
         )  # fmt: skip
         self._record(camera_to_world, status)
+
+        # --- New keyframe? (weak tracking, too few matches, moved or turned too far,
+        # or too many frames since the last one; see _needs_keyframe)
         if self._needs_keyframe(candidate, status, inliers):
             self._promote(candidate)
-            # the keyframe's pose may have moved (dense link, map reuse, bundle adjustment):
-            # predict the next frame from where it ended up, not from where it was tracked
+            # Making the keyframe may move its pose (dense link, map reuse, bundle
+            # adjustment): predict the next frame from where it ended up, not from where
+            # it was tracked.
             keyframe_pose = self.current_keyframe.camera_to_world
-            self.velocity = np.linalg.inv(self._pose(frame_index - 1)) @ keyframe_pose
+            self.previous_to_current_motion = (
+                np.linalg.inv(self._pose(frame_index - 1)) @ keyframe_pose
+            )
             self.last_good_pose = keyframe_pose
             return status, True
+
+        # Not a keyframe: remember it as the fallback for attempt 3 on later frames.
         self.last_tracked = candidate
         return status, False
 
     def _promote(self, candidate: Candidate) -> None:
         """Make an already recorded frame a keyframe; its record then points to it."""
-        status = self.frames[candidate.index].status
+        status = self.frames[candidate.index].status  # keep how the frame was tracked
         self._new_keyframe(candidate)
+        # The frame now IS its keyframe: identity pose relative to it, so it moves with it.
         self.frames[candidate.index] = FrameRecord(self.current_keyframe.id, np.eye(4), status)
 
     def _pose(self, frame_index: int) -> np.ndarray:
@@ -193,12 +247,16 @@ class Tracker:
 
     def _record(self, camera_to_world: np.ndarray, status: TrackingStatus) -> None:
         """Store the next frame's pose relative to the current keyframe."""
+        # Stored relative to the keyframe (not in world coordinates), so that when bundle
+        # adjustment later moves the keyframe, the frame moves with it.
         keyframe = self.current_keyframe
         camera_to_keyframe = np.linalg.inv(keyframe.camera_to_world) @ camera_to_world
         self.frames.append(FrameRecord(keyframe.id, camera_to_keyframe, status))
 
     def _plausible(self, camera_to_world: np.ndarray, predicted_pose: np.ndarray) -> bool:
         """True if the pose is within the allowed jump of the predicted pose."""
+        # A real camera can't teleport between two frames: a pose far from the prediction
+        # means the solver latched onto wrong matches.
         distance, angle = pose_change(predicted_pose, camera_to_world)
         return (
             distance < self.tracker_config.max_jump_translation
@@ -208,8 +266,11 @@ class Tracker:
     def _track_pnp(self, keyframe: Keyframe, features: Features, predicted_pose: np.ndarray | None):
         """Pose from matches with keyframe's map points.
 
-        Returns (camera_to_world, matched_points, inlier count) or (None, [], 0)."""
+        Returns (camera_to_world, matched_points, inlier count) or (None, [], 0).
+        Without a prediction (relocalization) there is no starting guess and no jump check."""
         orb_config = self.config.orb
+        # 1. Match this frame's descriptors with the keyframe features that have a map point
+        # (only those have a known 3D position).
         has_point = np.flatnonzero(keyframe.point_ids >= 0)
         frame_indices, keyframe_indices = match(
             features.descriptors, keyframe.features.descriptors[has_point], orb_config.ratio
@@ -218,6 +279,9 @@ class Tracker:
         world_points = np.array(
             [self.map.points[point_id].position for point_id in point_ids]
         ).reshape(-1, 3)
+
+        # 2. Pose from the 2D-3D matches (RANSAC ignores wrong matches), starting from the
+        # prediction. The solver works with world -> camera, the inverse of our poses.
         guess = None if predicted_pose is None else np.linalg.inv(predicted_pose)
         world_to_camera, inlier_indices = solve_pnp(
             world_points, features.pixels[frame_indices], self.intrinsics,
@@ -225,6 +289,9 @@ class Tracker:
         )  # fmt: skip
         if world_to_camera is None:
             return None, [], 0
+
+        # 3. Optional refinement that also uses each feature's measured depth, not only its
+        # pixel position (the same measurement bundle adjustment uses).
         if self.tracker_config.refine_with_depth:
             world_to_camera = refine_pose_with_depth(
                 world_to_camera, world_points[inlier_indices],
@@ -232,8 +299,13 @@ class Tracker:
                 self.config.ba.baseline, orb_config.scale_factor, self.config.ba.chi2,
             )  # fmt: skip
         camera_to_world = np.linalg.inv(world_to_camera)
+
+        # 4. Reject a pose that jumped too far from the prediction.
         if predicted_pose is not None and not self._plausible(camera_to_world, predicted_pose):
             return None, [], 0
+
+        # The inlier matches, as (feature index in this frame, map point id): a new keyframe
+        # made from this frame reuses those map points instead of creating duplicates.
         matched_points = list(
             zip(
                 frame_indices[inlier_indices].tolist(),
@@ -246,12 +318,15 @@ class Tracker:
     def _track_dense(self, color, depth, predicted_pose) -> np.ndarray | None:
         """Pose by dense alignment with the current keyframe, or None if it fails."""
         keyframe = self.current_keyframe
+        # Dense alignment works relative to the keyframe: start from the predicted pose
+        # expressed in the keyframe's frame, then convert the result back to world.
         success, camera_to_keyframe, _ = self.dense_odometry.align(
             self.dense_odometry.rgbd(color, depth),
             keyframe.rgbd,
             np.linalg.inv(keyframe.camera_to_world) @ predicted_pose,
         )
         camera_to_world = keyframe.camera_to_world @ camera_to_keyframe
+        # Even a "successful" alignment is rejected if it jumped too far.
         if success and self._plausible(camera_to_world, predicted_pose):
             return camera_to_world
         return None
@@ -261,18 +336,22 @@ class Tracker:
 
         A look-alike place elsewhere in the room can also give many inliers, so the pose must
         be near the last good one, unless the camera has been lost for a while."""
+        # Lost for long (or never tracked): the camera may really be anywhere by now.
         search_anywhere = (
             self.last_good_pose is None or self.lost_streak >= self.tracker_config.reloc_free_after
         )
         best_pose, best_matches, best_inliers, best_keyframe = None, [], 0, None
         for keyframe in self.map.keyframes:
             camera_to_world, matched_points, inliers = self._track_pnp(keyframe, features, None)
+            # No prediction to check against, so demand twice the usual inliers, and only
+            # keep a keyframe that beats the best one so far.
             if (
                 camera_to_world is None
                 or inliers < 2 * self.config.orb.min_inliers
                 or inliers <= best_inliers
             ):
                 continue
+            # Must also be near the last good pose, unless searching anywhere.
             if (
                 search_anywhere
                 or pose_change(self.last_good_pose, camera_to_world)[0]
@@ -280,6 +359,7 @@ class Tracker:
             ):
                 best_pose, best_matches, best_inliers = camera_to_world, matched_points, inliers
                 best_keyframe = keyframe
+        # Track the next frames against the keyframe that recognized this place.
         if best_keyframe is not None:
             self.current_keyframe = best_keyframe
         return best_pose, best_matches, best_inliers
@@ -289,11 +369,15 @@ class Tracker:
         keyframe, rules = self.current_keyframe, self.tracker_config
         distance, angle = pose_change(keyframe.camera_to_world, candidate.camera_to_world)
         return (
-            # features weak or just relocalized: refresh
+            # features failed (dense) or the camera just came back (reloc): get a fresh
+            # reference so the next frames can match features again
             status in (TrackingStatus.DENSE, TrackingStatus.RELOCALIZED)
+            # clearly fewer matches than the keyframe's first frame had: view is drifting away
             or inliers < rules.keyframe_min_inlier_ratio * keyframe.reference_inliers
+            # moved or turned too far from the keyframe
             or distance > rules.keyframe_max_translation
             or angle > rules.keyframe_max_rotation_deg
+            # too many frames since the keyframe, even if nothing else triggered
             or candidate.index - keyframe.frame >= rules.keyframe_max_frames
         )
 
@@ -302,6 +386,9 @@ class Tracker:
     def _new_keyframe(self, candidate: Candidate) -> None:
         """Turn a tracked frame into a keyframe: dense link, map points, BA, fusion."""
         start_time = time.perf_counter()
+
+        # --- Build the keyframe. Only features with usable depth are kept (a map point
+        # needs a 3D position), so feature indices shift: remember old -> new (-1 = dropped).
         has_depth = candidate.features.depth > 0
         index_in_keyframe = -np.ones(len(has_depth), int)  # frame feature -> keyframe feature
         index_in_keyframe[has_depth] = np.arange(has_depth.sum())
@@ -315,10 +402,11 @@ class Tracker:
             color=candidate.color,
             depth=candidate.depth,
         )
+        # --- Dense link to the previous keyframe: a precise motion (more iterations than
+        # tracking) that also sets the new keyframe's pose. Bundle adjustment uses it as a
+        # spring between the two keyframes. Rejected if it jumped too far from the tracked pose.
         previous = self.current_keyframe
-        if (
-            previous is not None
-        ):  # precise motion from the previous keyframe (dense, more iterations)
+        if previous is not None:
             success, relative_pose, information = self.dense_odometry.align(
                 keyframe.rgbd, previous.rgbd,
                 np.linalg.inv(previous.camera_to_world) @ candidate.camera_to_world,
@@ -333,12 +421,15 @@ class Tracker:
                 self.dense_links[1] += 1
         self.map.keyframes.append(keyframe)
 
+        # --- Give each feature a map point: reuse existing points wherever possible (shared
+        # points are what lets bundle adjustment tie keyframes together), new ones otherwise.
         # Without bundle adjustment nothing reconciles old points with new keyframe poses, so
         # sharing points would mix two slightly different versions of the world: each keyframe
         # then keeps only its own points (steps 1-3 need bundle adjustment).
         revisited = []
         if self.bundle_adjustment is not None:
-            # 1. sightings found while tracking: same points again
+            # 1. sightings found while tracking: same points again (skip features dropped
+            # for lacking depth, and points deleted since as outliers)
             for frame_feature, point_id in candidate.matched_points:
                 point = self.map.points.get(point_id)
                 keyframe_feature = index_in_keyframe[frame_feature]
@@ -348,7 +439,8 @@ class Tracker:
                     and keyframe.id not in point.sightings
                 ):
                     self.map.observe(point_id, keyframe, int(keyframe_feature))
-            # 2. more shared points from the neighbouring keyframes
+            # 2. more shared points from the neighbouring keyframes: the previous one, then
+            # those sharing most points with it, up to the bundle adjustment window
             if previous is not None:
                 neighbours = [previous.id] + [
                     neighbour_id
@@ -360,7 +452,8 @@ class Tracker:
             # 3. coming back to an area mapped long ago: reuse (and merge into) its points
             if self.config.reuse.enabled:
                 revisited = self._revisit(keyframe)
-        # 4. every remaining feature with depth becomes a new point
+        # 4. every remaining feature with depth becomes a new point: lift the pixel to 3D
+        # with its depth (camera frame), then move it into the world with the keyframe pose
         rotation, translation = keyframe.camera_to_world[:3, :3], keyframe.camera_to_world[:3, 3]
         for feature_index in np.flatnonzero(keyframe.point_ids < 0):
             (u, v) = keyframe.features.pixels[feature_index]
@@ -371,6 +464,7 @@ class Tracker:
             self.map.add_point(rotation @ camera_point + translation, keyframe, int(feature_index))
 
         # 5. align to the settled voxel map: a pull towards where the surface says keyframe is
+        # (only useful with bundle adjustment, which is what applies that pull)
         map_links = {}
         if (
             self.mapper is not None
@@ -381,7 +475,11 @@ class Tracker:
             if map_link is not None:
                 map_links[keyframe.id] = map_link
 
+        # The new keyframe is the reference for the next frames. Clear last_tracked: that
+        # frame is older than the keyframe now, so it is no use as a fallback.
         self.current_keyframe, self.last_tracked = keyframe, None
+        # Local bundle adjustment: correct this keyframe, its neighbours and their points
+        # together (needs at least two keyframes).
         if self.bundle_adjustment is not None and len(self.map.keyframes) > 1:
             self.bundle_adjustment_stats.append(
                 self.bundle_adjustment.optimize(self.map, keyframe, revisited, map_links)
@@ -399,6 +497,8 @@ class Tracker:
     def _fuse_points(self, keyframe: Keyframe, other: Keyframe) -> None:
         """Features of keyframe that match a map point of `other` by descriptor AND project
         within fuse_px of where that point lands in keyframe become sightings of that point."""
+        # Candidates: features of keyframe still without a point, vs. other's features that
+        # have one. Match them by descriptor (looks alike).
         free_features = np.flatnonzero(keyframe.point_ids < 0)
         other_has_point = np.flatnonzero(other.point_ids >= 0)
         free_matched, other_matched = match(
@@ -413,9 +513,13 @@ class Tracker:
             free_features[free_matched], other.point_ids[other_has_point[other_matched]],
             strict=True,
         ):  # fmt: skip
+            # the point may be gone (outlier) or already seen by keyframe via another feature
             point = self.map.points.get(int(point_id))
             if point is None or keyframe.id in point.sightings:
                 continue
+            # Geometric check: project the point into keyframe; it must be in front of the
+            # camera and land close to the matched feature (looks alike AND is in the right
+            # place).
             camera_point = world_to_camera[:3, :3] @ point.position + world_to_camera[:3, 3]
             if camera_point[2] <= 0:
                 continue
@@ -446,10 +550,13 @@ class Tracker:
            too. Bundle adjustment then optimizes keyframe together with the old keyframes.
         """
         reuse_config = self.config.reuse
-        centre = keyframe.camera_to_world[:3, 3]
-        viewing_direction = keyframe.camera_to_world[:3, 2]
+        # --- 1. Candidates: old keyframes near this camera and looking the same way.
+        centre = keyframe.camera_to_world[:3, 3]  # camera position
+        viewing_direction = keyframe.camera_to_world[:3, 2]  # camera's z axis
+        # keyframes already sharing points with this one are tied to it already
         already_linked = {neighbour_id for neighbour_id, _ in self.map.covisible(keyframe)}
         candidates = []
+        # the most recent keyframes are skipped: they are not a "revisit"
         old_count = max(0, keyframe.id - reuse_config.skip_recent)
         for old in self.map.keyframes[:old_count]:
             if old.id in already_linked:
@@ -460,13 +567,16 @@ class Tracker:
             if distance < reuse_config.max_distance and angle < reuse_config.max_angle_deg:
                 candidates.append((distance, old.id))
         used = []
+        # closest candidates first, at most max_keyframes of them
         for _, old_id in sorted(candidates)[: reuse_config.max_keyframes]:
             self.reuse["tried"] += 1
+            # --- 2. Match the old keyframe's points with this keyframe's features.
             feature_indices, point_ids = self._match_by_projection(
                 keyframe, self.map.keyframes[old_id]
             )
             if len(feature_indices) < reuse_config.min_inliers:
                 continue
+            # --- 3. Geometric check: where would the camera be according to the old points?
             world_points = np.array([self.map.points[point_id].position for point_id in point_ids])
             world_to_camera, inlier_indices = solve_pnp(
                 world_points, keyframe.features.pixels[feature_indices], self.intrinsics,
@@ -476,9 +586,11 @@ class Tracker:
             if world_to_camera is None:
                 continue
             camera_to_world = np.linalg.inv(world_to_camera)
+            # The correction must be drift-sized: a large one means a look-alike place.
             distance, angle = pose_change(keyframe.camera_to_world, camera_to_world)
             if distance > reuse_config.max_correction or angle > reuse_config.max_correction_deg:
                 continue
+            # --- 4. Accepted: move the keyframe onto the old map and tie it to the old points.
             keyframe.camera_to_world = camera_to_world  # snap onto the old map
             for feature_index, point_id in zip(
                 feature_indices[inlier_indices].tolist(), point_ids[inlier_indices].tolist(),
@@ -488,6 +600,8 @@ class Tracker:
                 if own_point_id >= 0:
                     self.map.merge(point_id, own_point_id)  # recent duplicate -> the old point
                     self.reuse["merged"] += 1
+                # the feature has no point yet: just record it as a sighting of the old one
+                # (unless an earlier merge removed the point, or keyframe already sees it)
                 elif (
                     point_id in self.map.points
                     and keyframe.id not in self.map.points[point_id].sightings
@@ -504,6 +618,7 @@ class Tracker:
         reuse_config = self.config.reuse
         intrinsics = self.intrinsics
         no_match = (np.zeros(0, int), np.zeros(0, int))
+        # --- The old keyframe's map points that this keyframe doesn't see yet.
         old_features = np.flatnonzero(old.point_ids >= 0)
         point_ids = old.point_ids[old_features]
         not_seen_yet = np.array(
@@ -513,10 +628,11 @@ class Tracker:
         old_features, point_ids = old_features[not_seen_yet], point_ids[not_seen_yet]
         if len(old_features) == 0 or len(keyframe.features.pixels) == 0:
             return no_match
+        # --- Project them into this keyframe with its current (slightly drifted) pose.
         world_points = np.array([self.map.points[point_id].position for point_id in point_ids])
         world_to_camera = np.linalg.inv(keyframe.camera_to_world)
         camera_points = world_points @ world_to_camera[:3, :3].T + world_to_camera[:3, 3]
-        safe_depth = np.maximum(camera_points[:, 2], 1e-6)
+        safe_depth = np.maximum(camera_points[:, 2], 1e-6)  # avoids dividing by zero
         projected = np.stack(
             [
                 intrinsics.fx * camera_points[:, 0] / safe_depth + intrinsics.cx,
@@ -524,6 +640,7 @@ class Tracker:
             ],
             1,
         )
+        # keep points at least 10 cm in front of the camera that land inside the image
         visible = (
             (camera_points[:, 2] > 0.1)
             & (projected[:, 0] >= 0)
@@ -535,18 +652,24 @@ class Tracker:
         )  # fmt: skip
         if len(old_features) == 0:
             return no_match
+        # --- Score every (point, feature) pair: (points, features) tables of how far apart
+        # they are in the image and how different they look.
         pixel_distance = np.linalg.norm(
             projected[:, None, :] - keyframe.features.pixels[None, :, :], axis=2
         )
         descriptor_distance = hamming(
             old.features.descriptors[old_features], keyframe.features.descriptors
         )
+        # A pair is allowed only if close in the image AND similar-looking; its score is
+        # the descriptor distance (lower = better), infinite when not allowed.
         close_enough = (pixel_distance < reuse_config.search_px) & (
             descriptor_distance <= reuse_config.max_hamming
         )
         score = np.where(close_enough, descriptor_distance, np.inf)
-        best_feature = score.argmin(axis=1)
+        best_feature = score.argmin(axis=1)  # each point's best-looking feature
         best_score = score[np.arange(len(best_feature)), best_feature]
+
+        # --- Assign greedily, best pairs first, so each feature is used at most once.
         taken, matched_features, matched_points = set(), [], []
         for point_index in np.argsort(best_score):  # closest descriptors first
             feature_index = best_feature[point_index]

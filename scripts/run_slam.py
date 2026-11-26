@@ -35,6 +35,8 @@ from voxel_gaussian.slam.tracker import Tracker
 from voxel_gaussian.tsdf.surface import extract_points, save_ply
 from voxel_gaussian.tsdf.volume import TSDFVolume
 
+# --- Settings: yamls/base.yaml, then the --experiment file, then --set overrides.
+# start_run makes a new, time-stamped run folder and saves the final settings into it.
 arguments = config_parser(__doc__).parse_args()
 config = config_from_args(arguments)
 run_folder = start_run(config, arguments.experiment, arguments.set)
@@ -42,18 +44,22 @@ slam_config = config.slam
 
 # ------------------------------------------------------------------ input frames
 
+# The dataset's RGB-D images, camera intrinsics, timestamps and true (ground-truth) poses.
 image_sequence = load_sequence(config.dataset, data_root() / config.dataset.path)
 # Images are shrunk by this whole factor (every n-th pixel) to at most slam.max_width wide.
 image_downscale = max(1, math.ceil(config.dataset.width / slam_config.max_width))
+# smaller images need intrinsics (focal length, image centre) scaled the same way
 intrinsics = image_sequence.intrinsics.scaled(image_downscale)
-# Dataset frame numbers used in this run; a frame's position in this list is its SLAM index.
+# Dataset frame numbers used in this run (every frame_step-th, at most max_frames of them);
+# a frame's position in this list is its SLAM index.
 frame_numbers = list(range(0, len(image_sequence), slam_config.frame_step))[
     : slam_config.max_frames
 ]
+# True poses are only used to measure the error afterwards, never fed to the tracker.
 true_poses = image_sequence.gt_poses[frame_numbers]
 timestamps = image_sequence.timestamps[frame_numbers]
 save_tum(run_folder / "gt.txt", timestamps, true_poses)
-# with bundle adjustment / keyframes only
+# Label for this run in results.yaml and the plot: with bundle adjustment / keyframes only
 method_name = "slam_ba" if slam_config.ba.enabled else "slam_kf"
 print(
     f"{config.dataset.name}: {len(frame_numbers)} frames, "
@@ -63,15 +69,18 @@ print(
 
 # ------------------------------------------------------------------ tracking
 
-device = get_device()
+device = get_device()  # GPU if available; used by the voxel map
 tracker = Tracker(intrinsics, slam_config, config.tsdf, device)
-tracking_ms_per_frame = []  # only frames that did not create a keyframe
+# Time of ordinary frames only: keyframes are much slower (bundle adjustment, fusion) and
+# are timed separately by the tracker (tracker.keyframe_ms).
+tracking_ms_per_frame = []
 for frame_index, frame_number in enumerate(frame_numbers):
     color, depth = image_sequence.read(frame_number, image_downscale)
     start_time = time.perf_counter()
     _, became_keyframe = tracker.process(color, depth)
     if not became_keyframe:  # the first frame always becomes a keyframe
         tracking_ms_per_frame.append((time.perf_counter() - start_time) * 1000)
+    # progress line every 200 frames
     if frame_index % 200 == 0 and frame_index:
         lost_frames = sum(record.status == TrackingStatus.LOST for record in tracker.frames)
         print(
@@ -86,17 +95,25 @@ tracker.finish()  # fuse the keyframes still being optimized at the end
 
 # ------------------------------------------------------------------ trajectory accuracy
 
+# Read the poses only now, after tracking: bundle adjustment kept correcting keyframes until
+# the end, and every frame's pose follows its keyframe.
 estimated_poses = tracker.poses()
 keyframe_indices, keyframe_poses = tracker.keyframe_poses()  # indices into frame_numbers
 save_tum(run_folder / "slam.txt", timestamps, estimated_poses)
 save_tum(run_folder / "keyframes.txt", timestamps[keyframe_indices], keyframe_poses)
+# ATE (absolute trajectory error): distance to the true path after the best rigid
+# alignment of the two (SLAM starts at the origin, the dataset doesn't).
+# RPE (relative pose error): error of each frame-to-frame motion, i.e. local drift.
 absolute_error = ate(estimated_poses, true_poses)
 relative_error = rpe(estimated_poses, true_poses)
 keyframe_absolute_error = ate(keyframe_poses, true_poses[keyframe_indices])
 
-# plain strings as keys: yaml.safe_dump cannot write enum members
+# How each frame was tracked (pnp, dense, reloc, lost, ...), counted.
+# Plain strings as keys: yaml.safe_dump cannot write enum members.
 status_counts = Counter(record.status.value for record in tracker.frames)
+# empty entries are keyframes where bundle adjustment had nothing to optimize
 bundle_adjustment_runs = [stats for stats in tracker.bundle_adjustment_stats if stats]
+# Everything below goes into results.yaml; the key names stay fixed so runs can be compared.
 result = {
     "frames": len(frame_numbers),
     "keyframes": len(keyframe_indices),
@@ -124,7 +141,7 @@ if slam_config.ba.enabled and slam_config.reuse.enabled:  # coming back to mappe
         if reuse_stats["correction_cm"]
         else 0.0,
     }
-if bundle_adjustment_runs:
+if bundle_adjustment_runs:  # averages over all bundle adjustment runs
     result["ba"] = {
         "ms_median": float(np.median([run["ms"] for run in bundle_adjustment_runs])),
         "window_mean": float(np.mean([run["window"] for run in bundle_adjustment_runs])),
@@ -136,8 +153,9 @@ if bundle_adjustment_runs:
 
 # ------------------------------------------------------------------ voxel map
 
-if tracker.mapper is not None:
+if tracker.mapper is not None:  # only when the voxel map is switched on (slam.map.enabled)
     mapper, tsdf_config = tracker.mapper, config.tsdf
+    # Our surface: points on the voxel map built from the SLAM poses.
     surface_points, surface_colors, surface_normals = extract_points(
         mapper.volume, tsdf_config.min_weight
     )
@@ -173,13 +191,17 @@ if tracker.mapper is not None:
         },
         run_folder / "map.pt",
     )
-    # our map is in SLAM's frame (frame 0 = origin): move it like the ATE alignment does
+    # Our map is in SLAM's frame (frame 0 = origin), the reference in the dataset's: move ours
+    # onto it with the rigid alignment of the keyframe positions (like ATE does), then compare.
     rotation, translation = align_rigid(
         keyframe_poses[:, :3, 3], true_poses[keyframe_indices][:, :3, 3]
     )
+    # accuracy: how far our points are from the reference surface;
+    # completeness: how far reference points are from ours (missing surface)
     surface_accuracy = surface_errors(
         surface_points.cpu().numpy() @ rotation.T + translation, reference_points.cpu().numpy()
     )
+    # How often aligning a new keyframe to the voxel map (ICP) was tried / accepted / rejected
     icp_counts = mapper.stats["icp"]
     result["map"] = {
         **surface_accuracy,
@@ -200,12 +222,14 @@ if tracker.mapper is not None:
 
 with open(run_folder / "results.yaml", "w") as results_file:
     yaml.safe_dump({method_name: result}, results_file, sort_keys=False)
+# Left: top view of the true path and ours (aligned). Right: position error of every frame.
 plot_trajectories(
     run_folder / "trajectories.png",
     true_poses[:, :3, 3],
     {method_name: absolute_error["aligned_xyz"]},
     {method_name: absolute_error["errors_cm"]},
 )
+# Summary on the terminal: the main numbers as a table, then each section's details.
 print_table(
     {method_name: result},
     ["keyframes", "lost", "ate_rmse_cm", "kf_ate_rmse_cm", "rpe_rot_deg", "frame_ms_median"],
