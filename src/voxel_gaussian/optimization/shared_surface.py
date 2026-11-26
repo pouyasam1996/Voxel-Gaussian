@@ -30,6 +30,9 @@ from the camera, the push goes into the voxel values: the surface itself moves.
 Gaussians whose cell can't be read (a corner missing, seen too rarely, outside the truncation
 band, or a flat blend) are not attached: they keep start + slide, like the free mode.
 
+Several levels (Step 5, tsdf/adaptive.py): each Gaussian has a level and reads the cell of
+that level's map, with that level's voxel size; the corner table holds corners of all levels.
+
 Example: a Gaussian sits where phi = +1 cm and the slope points along +z with length 1. The step
 moves it 1 cm along -z, onto the surface. If the photos keep asking for it 3 mm further out,
 dphi of its 8 corners grows by about 3 mm in total, and the surface there moves 3 mm.
@@ -62,31 +65,48 @@ def corner_index(vol: TSDFVolume, cells: torch.Tensor, min_weight: float):
 
 
 class SharedSurface(nn.Module):
-    def __init__(self, vol: TSDFVolume, start: torch.Tensor, cfg: SurfaceConfig, min_weight: float):
-        """vol: the voxel map; start: (N, 3) starting Gaussian centres (init.from_surface)."""
+    def __init__(self, vols, start: torch.Tensor, cfg: SurfaceConfig, min_weight: float,
+                 level: torch.Tensor | None = None):  # fmt: skip
+        """vols: the voxel map, or a list of maps (levels); start: (N, 3) starting Gaussian
+        centres (init.from_surface); level: (N,) which map each Gaussian reads (default 0)."""
         super().__init__()
+        vols = vols if isinstance(vols, list | tuple) else [vols]
         self.cfg = cfg
-        self.voxel = vol.voxel_size
         self.learn = cfg.mode == "learned"
-        cells = torch.floor(start / self.voxel).long()
-        flat, ok = corner_index(vol, cells, min_weight)
-        used, inverse = torch.unique(flat[ok], return_inverse=True)  # corners of attached ones
-        corner = torch.zeros_like(flat)
-        corner[ok] = inverse.reshape(-1, 8)
+        n = len(start)
+        level = torch.zeros(n, dtype=torch.long, device=start.device) if level is None else level
+        size = torch.tensor([v.voxel_size for v in vols], device=start.device)[level]
+        cells = torch.floor(start / size[:, None]).long()
+        corner = torch.zeros(n, 8, dtype=torch.long, device=start.device)
+        ok = torch.zeros(n, dtype=torch.bool, device=start.device)
+        storage, codes, fused, table_level = [], [], [], []
+        for lv, vol in enumerate(vols):
+            mine = (level == lv).nonzero().squeeze(1)
+            flat, ok_l = corner_index(vol, cells[mine], min_weight)
+            used, inverse = torch.unique(flat[ok_l], return_inverse=True)
+            corner[mine[ok_l]] = inverse.reshape(-1, 8) + sum(len(s) for s in storage)
+            ok[mine] = ok_l
+            b3 = vol.block**3
+            rows, cols = used // b3, used % b3
+            storage.append(used)
+            codes.append(encode(vol.keys[rows] * vol.block + vol.local[cols]))
+            fused.append(vol.tsdf.view(-1)[used] * vol.trunc)  # metres
+            table_level.append(torch.full_like(used, lv))
 
-        b3 = vol.block**3
-        rows, cols = used // b3, used % b3
         self.register_buffer("start", start.detach().clone())
+        self.register_buffer("voxel", size)  # (N,) voxel size of each Gaussian's level
+        self.register_buffer("level", level)
         self.register_buffer("cell", cells.float())  # cell origin, in voxels
         self.register_buffer("corner", corner)  # (N, 8) index into the corner table
-        self.register_buffer("storage", used)  # corner table -> flat storage index in vol
-        self.register_buffer("codes", encode(vol.keys[rows] * vol.block + vol.local[cols]))
-        self.register_buffer("fused", vol.tsdf.view(-1)[used] * vol.trunc)  # metres
+        self.register_buffer("storage", torch.cat(storage))  # -> flat index in its level's map
+        self.register_buffer("table_level", torch.cat(table_level))
+        self.register_buffer("codes", torch.cat(codes))  # voxel codes (per level)
+        self.register_buffer("fused", torch.cat(fused))
         self.register_buffer("attached", ok)
-        self.dphi = nn.Parameter(torch.zeros(len(used), device=start.device))
+        self.dphi = nn.Parameter(torch.zeros(len(self.fused), device=start.device))
         self.dphi.requires_grad_(self.learn)  # tied: the surface stays as fused
         self.slide = nn.Parameter(torch.zeros_like(start))
-        self.lift_raw = nn.Parameter(torch.zeros(len(start), device=start.device))
+        self.lift_raw = nn.Parameter(torch.zeros(n, device=start.device))
 
         with torch.no_grad():  # a flat blend has no direction to step along
             _, g = self.read(self.start)
@@ -95,7 +115,7 @@ class SharedSurface(nn.Module):
     def read(self, q: torch.Tensor):
         """phi (N,) in metres and its slope g (N, 3) at points q (N, 3), one per Gaussian,
         each from its own cell's 8 corners."""
-        f = q / self.voxel - self.cell  # position inside the cell: 0..1 per axis
+        f = q / self.voxel[:, None] - self.cell  # position inside the cell: 0..1 per axis
         v = (self.fused + self.dphi)[self.corner]  # (N, 8)
         c = CORNERS.to(q.device).bool()
         w = torch.where(c, f[:, None, :], 1 - f[:, None, :])  # (N, 8, 3) blend factors
@@ -105,7 +125,7 @@ class SharedSurface(nn.Module):
             [(sign[:, a] * w[..., (a + 1) % 3] * w[..., (a + 2) % 3] * v).sum(1) for a in range(3)],
             dim=-1,
         )
-        return phi, g / self.voxel
+        return phi, g / self.voxel[:, None]
 
     def means(self):
         """(N, 3) Gaussian centres on the surface, and (N, 3) unit surface normals."""
@@ -115,14 +135,14 @@ class SharedSurface(nn.Module):
         normal = g / g2.sqrt()[:, None]
         p = q - (phi / g2)[:, None] * g
         if self.cfg.lift_max > 0:
-            lift = self.cfg.lift_max * self.voxel * torch.tanh(self.lift_raw)
+            lift = self.cfg.lift_max * self.voxel * torch.tanh(self.lift_raw)  # (N,)
             p = p + lift[:, None] * normal
         return torch.where(self.attached[:, None], p, q), normal
 
     def shape_penalty(self, quats: torch.Tensor, normal: torch.Tensor) -> torch.Tensor:
         """Slide beyond slide_free, and disc tilt beyond tilt_free_deg (attached Gaussians)."""
         cfg = self.cfg
-        excess = (self.slide.norm(dim=-1) - cfg.slide_free * self.voxel).clamp(min=0)
+        excess = (self.slide.norm(dim=-1) - cfg.slide_free * self.voxel).clamp(min=0)  # (N,)
         loss = cfg.slide_weight * (excess**2).mean()
         if cfg.tilt_weight > 0 and self.attached.any():
             axis = quat_to_rotmat(quats[self.attached])[:, :, 2]  # the disc's thin side
@@ -136,14 +156,34 @@ class SharedSurface(nn.Module):
         return self.cfg.dphi_weight * (excess**2).mean() if len(self.dphi) else self.dphi.sum()
 
     @torch.no_grad()
-    def corrected(self, vol: TSDFVolume) -> TSDFVolume:
-        """A copy of the voxel map with dphi added: for extracting the corrected surface and
-        aligning cameras to it. Values stay within the truncation band [-1, 1]."""
+    def corrected(self, vol: TSDFVolume, level: int = 0) -> TSDFVolume:
+        """A copy of one level's voxel map with dphi added: for extracting the corrected
+        surface and aligning cameras to it. Values stay within the truncation band [-1, 1]."""
         # clone: on the CPU, state() hands out the map's own tensors, not copies
         out = TSDFVolume.from_state({k: v.clone() if torch.is_tensor(v) else v
                                      for k, v in vol.state().items()}, vol.device)  # fmt: skip
-        out.tsdf.view(-1)[self.storage] = ((self.fused + self.dphi) / vol.trunc).clamp(-1, 1)
+        m = self.table_level == level
+        value = (self.fused[m] + self.dphi[m]) / vol.trunc
+        out.tsdf.view(-1)[self.storage[m]] = value.clamp(-1, 1)
         return out
+
+    @torch.no_grad()
+    def regroup(self, parent: torch.Tensor, start: torch.Tensor) -> "SharedSurface":
+        """The same surface for a new set of Gaussians (after gaussians/densify.py split some
+        and removed others): Gaussian k takes the cell, level and corners of Gaussian
+        parent[k] and starts at start[k], sliding from 0 again. dphi is shared, not copied."""
+        new = SharedSurface.__new__(SharedSurface)
+        nn.Module.__init__(new)
+        new.cfg, new.learn = self.cfg, self.learn
+        for name in ("voxel", "level", "cell", "corner", "attached"):
+            new.register_buffer(name, getattr(self, name)[parent].clone())
+        for name in ("storage", "table_level", "codes", "fused"):
+            new.register_buffer(name, getattr(self, name))
+        new.register_buffer("start", start.detach().clone())
+        new.dphi = self.dphi
+        new.slide = nn.Parameter(torch.zeros_like(start))
+        new.lift_raw = nn.Parameter(torch.zeros(len(start), device=start.device))
+        return new
 
     @torch.no_grad()
     def stats(self) -> dict:

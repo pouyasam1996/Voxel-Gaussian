@@ -154,6 +154,21 @@ surface:                   # one shared voxel-Gaussian surface (optimization/sha
   realign_points: 2000     # depth points per keyframe
   realign_huber: 0.02      # gaps beyond this count linearly, m
 
+adaptive:                  # Step 5: finer voxels only where the surface bends (tsdf/adaptive.py)
+  enabled: false
+  fine_factor: 2           # fine voxel = tsdf voxel / this (5 cm -> 2.5 cm)
+  share: 0.3               # share of the 40 cm surface blocks refined, the most curved first
+                           # (on room0 the top 30% held 56% of the 5 cm map's surface error)
+  max_distance: 3.0        # only blocks some keyframe saw from within this, m (also used to
+                           # mark the detailed region in the surface scores)
+
+densify:                   # Step 5: more blobs where the colour has detail (gaussians/densify.py)
+  rounds: 0                # training is cut into rounds + 1 equal parts, splitting in between
+                           # (0 = off)
+  share: 0.05              # share of the drawn blobs split each round, worst colour error first
+  views: 20                # training keyframes used to measure each blob's colour error
+  min_opacity: 0.05        # blobs fainter than this are removed at each round
+
 depth_noise:               # synthetic depth noise added when reading depth (0 = off): the
                            # controlled test on Replica, whose rendered depth is perfect
   sigma: 0.0               # per-pixel standard deviation, m ...

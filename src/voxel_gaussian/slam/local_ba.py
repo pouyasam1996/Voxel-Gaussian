@@ -12,12 +12,12 @@ the solver finds the poses and points with the lowest total spring energy:
    matches can't pull everything. Disparity noise of 1 px means depth noise ~ d^2 / (fx b),
    so far points weigh less, like a real depth sensor.
 
-2. Dense keyframe-to-keyframe links (from Open3D). The measured motion Z between consecutive
-   keyframes, with a 6-direction stiffness: Open3D's information matrix. It counts every pixel
-   as independent (far too stiff), so we keep its shape (which directions were pinned) and
-   rescale it so a typical translation error is `dense_link_sigma`. Open3D measures the error
-   in the older keyframe's frame, GTSAM in the newer one's: the frame change is
-   info_gtsam = Ad^T info Ad, with Ad = Z's adjoint (GTSAM's AdjointMap).
+2. Dense keyframe-to-keyframe links (from Open3D). The measured relative pose between
+   consecutive keyframes, with a 6-direction stiffness: Open3D's information matrix. It counts
+   every pixel as independent (far too stiff), so we keep its shape (which directions were
+   pinned) and rescale it so a typical translation error is `dense_link_sigma`. Open3D
+   measures the error in the older keyframe's frame, GTSAM in the newer one's: the frame
+   change is info_gtsam = Ad^T info Ad, with Ad = the relative pose's adjoint (AdjointMap).
 
 3. Anchors: keyframes outside the window that also see these points are held fixed (stiff
    priors), and so is keyframe 0. Without anchors the whole window could slide.
@@ -30,46 +30,60 @@ import time
 
 import gtsam
 import numpy as np
-from gtsam.symbol_shorthand import L, X
+from gtsam.symbol_shorthand import L as point_key
+from gtsam.symbol_shorthand import X as pose_key
 
 from voxel_gaussian.common.camera import Intrinsics
 from voxel_gaussian.common.config import LocalBAConfig
-from voxel_gaussian.slam.keyframe import Map
+from voxel_gaussian.slam.keyframe import Keyframe, Map
 
-FIXED = gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)
+FIXED_POSE_NOISE = gtsam.noiseModel.Isotropic.Sigma(6, 1e-6)
+
+
+def _symmetric_with_floor(information: np.ndarray) -> np.ndarray:
+    """Make an information matrix exactly symmetric, with a tiny floor on every direction."""
+    return 0.5 * (information + information.T) + 1e-6 * np.mean(np.diag(information)) * np.eye(6)
 
 
 class LocalBA:
-    def __init__(self, K: Intrinsics, cfg: LocalBAConfig, scale_factor: float):
-        self.cfg = cfg
-        self.cal = gtsam.Cal3_S2Stereo(K.fx, K.fy, 0.0, K.cx, K.cy, cfg.baseline)
-        self.fb = K.fx * cfg.baseline
-        self.scale = scale_factor
-        self.huber = gtsam.noiseModel.mEstimator.Huber.Create(np.sqrt(cfg.chi2))
-        self.noise: dict[int, object] = {}  # robust noise model per pyramid level
+    """Local bundle adjustment (GTSAM) over the newest keyframes, their points and links."""
+
+    def __init__(self, intrinsics: Intrinsics, config: LocalBAConfig, scale_factor: float):
+        self.config = config
+        self.stereo_calibration = gtsam.Cal3_S2Stereo(
+            intrinsics.fx, intrinsics.fy, 0.0, intrinsics.cx, intrinsics.cy, config.baseline
+        )
+        self.focal_times_baseline = intrinsics.fx * config.baseline
+        self.scale_factor = scale_factor
+        self.huber = gtsam.noiseModel.mEstimator.Huber.Create(np.sqrt(config.chi2))
+        self.noise_by_level: dict[int, object] = {}  # robust noise model per pyramid level
         self._link_factors: list = []
 
-    def sigma(self, octave: int) -> float:
-        return self.scale**octave
+    def pixel_sigma(self, pyramid_level: int) -> float:
+        """Pixel noise of a feature found at a pyramid level (scale_factor^level)."""
+        return self.scale_factor**pyramid_level
 
-    def _noise(self, octave: int):
-        if octave not in self.noise:
-            base = gtsam.noiseModel.Isotropic.Sigma(3, self.sigma(octave))
-            self.noise[octave] = gtsam.noiseModel.Robust.Create(self.huber, base)
-        return self.noise[octave]
+    def _sighting_noise(self, pyramid_level: int):
+        """Robust (Huber) 3D stereo noise model for a pyramid level, cached."""
+        if pyramid_level not in self.noise_by_level:
+            gaussian = gtsam.noiseModel.Isotropic.Sigma(3, self.pixel_sigma(pyramid_level))
+            self.noise_by_level[pyramid_level] = gtsam.noiseModel.Robust.Create(
+                self.huber, gaussian
+            )
+        return self.noise_by_level[pyramid_level]
 
-    def _link_noise(self, Z: np.ndarray, info: np.ndarray):
+    def _link_noise(self, relative_pose: np.ndarray, information: np.ndarray):
         """Open3D's information matrix -> GTSAM noise model (rescaled, frame changed)."""
-        n = np.mean(np.diag(info)[3:])  # = number of matched pixels (translation block)
-        if n <= 0:
+        # mean of the translation block = number of matched pixels
+        matched_pixels = np.mean(np.diag(information)[3:])
+        if matched_pixels <= 0:
             return None
-        info = info / (n * self.cfg.dense_link_sigma**2)
-        Ad = gtsam.Pose3(Z).AdjointMap()
-        info = Ad.T @ info @ Ad
-        info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
-        return gtsam.noiseModel.Gaussian.Information(info)
+        information = information / (matched_pixels * self.config.dense_link_sigma**2)
+        adjoint = gtsam.Pose3(relative_pose).AdjointMap()
+        information = adjoint.T @ information @ adjoint
+        return gtsam.noiseModel.Gaussian.Information(_symmetric_with_floor(information))
 
-    def _map_noise(self, link: dict):
+    def _map_noise(self, map_link: dict):
         """Alignment to the voxel map -> GTSAM noise model for a pose prior.
 
         The ICP information is for a turn around the scan's centre c then a shift, in world
@@ -78,120 +92,166 @@ class LocalBA:
         world axes -> camera axes: the pose's adjoint. info_gtsam = A^T info A, A = A1 Ad.
         Rescaled like the dense links: shape from ICP, overall stiffness from `sigma`.
         """
-        info, c, sigma = link["info"], link["pivot"], link["sigma"]
-        n = np.mean(np.diag(info)[3:])
-        if n <= 0:
+        information, pivot, sigma = map_link["information"], map_link["pivot"], map_link["sigma"]
+        scale = np.mean(np.diag(information)[3:])
+        if scale <= 0:
             return None
-        info = info / (n * sigma**2)
-        A1 = np.eye(6)
-        A1[3:, :3] = -np.array([[0, -c[2], c[1]], [c[2], 0, -c[0]], [-c[1], c[0], 0]])
-        A = A1 @ gtsam.Pose3(link["T"]).AdjointMap()
-        info = A.T @ info @ A
-        info = 0.5 * (info + info.T) + 1e-6 * np.mean(np.diag(info)) * np.eye(6)
-        return gtsam.noiseModel.Gaussian.Information(info)
+        information = information / (scale * sigma**2)
+        pivot_change = np.eye(6)
+        pivot_change[3:, :3] = -np.array(
+            [[0, -pivot[2], pivot[1]], [pivot[2], 0, -pivot[0]], [-pivot[1], pivot[0], 0]]
+        )
+        transform = pivot_change @ gtsam.Pose3(map_link["camera_to_world"]).AdjointMap()
+        information = transform.T @ information @ transform
+        return gtsam.noiseModel.Gaussian.Information(_symmetric_with_floor(information))
 
-    def optimize(self, mp: Map, kf, include: list[int] = (), map_links: dict | None = None) -> dict:
-        """Optimize kf, the old keyframes in `include` (revisited areas) and kf's most
-        covisible neighbours, up to `window` keyframes in total. `map_links`: keyframe id ->
+    def optimize(
+        self,
+        slam_map: Map,
+        keyframe: Keyframe,
+        include: list[int] = (),
+        map_links: dict | None = None,
+    ) -> dict:
+        """Optimize keyframe, the old keyframes in `include` (revisited areas) and keyframe's
+        most covisible neighbours, up to `window` keyframes in total. `map_links`: keyframe id ->
         alignment to the voxel map (a pull towards that pose, stiff where the surface pins it)."""
-        t0 = time.perf_counter()
-        cfg = self.cfg
-        window = [kf.id, *[i for i in include if i != kf.id]]
-        for i, n in mp.covisible(kf):
-            if len(window) >= cfg.window or n < cfg.min_shared_points:
+        start_time = time.perf_counter()
+        config = self.config
+        window = [keyframe.id, *[i for i in include if i != keyframe.id]]
+        for neighbour_id, shared_points in slam_map.covisible(keyframe):
+            if len(window) >= config.window or shared_points < config.min_shared_points:
                 break
-            if i not in window:
-                window.append(i)
-        pids = sorted({int(p) for i in window for p in mp.keyframes[i].point_ids if p >= 0})
-        shared: dict[int, int] = {}  # other keyframes seeing these points: how many each
-        for p in pids:
-            for i in mp.points[p].obs:
-                if i not in window:
-                    shared[i] = shared.get(i, 0) + 1
+            if neighbour_id not in window:
+                window.append(neighbour_id)
+        point_ids = sorted(
+            {
+                int(point_id)
+                for keyframe_id in window
+                for point_id in slam_map.keyframes[keyframe_id].point_ids
+                if point_id >= 0
+            }
+        )
+        shared_count: dict[int, int] = {}  # other keyframes seeing these points: how many each
+        for point_id in point_ids:
+            for keyframe_id in slam_map.points[point_id].sightings:
+                if keyframe_id not in window:
+                    shared_count[keyframe_id] = shared_count.get(keyframe_id, 0) + 1
         # anchors: the keyframes outside the window sharing the most points (capped for speed)
-        fixed = sorted(sorted(shared, key=lambda i: -shared[i])[: cfg.max_fixed_keyframes])
+        most_shared = sorted(shared_count, key=lambda keyframe_id: -shared_count[keyframe_id])
+        fixed = sorted(most_shared[: config.max_fixed_keyframes])
         if 0 in window or not fixed:  # anchor: keyframe 0, or else the oldest in the window
             fixed.append(0 if 0 in window else min(window))
-        free = [i for i in window if i not in fixed]
+        free = [keyframe_id for keyframe_id in window if keyframe_id not in fixed]
         if not free:
             return {}
 
-        map_links = {i: m for i, m in (map_links or {}).items() if i in free}
-        removed, map_dropped = 0, 0
+        map_links = {
+            keyframe_id: link
+            for keyframe_id, link in (map_links or {}).items()
+            if keyframe_id in free
+        }
+        removed_sightings, dropped_map_links = 0, 0
         for _ in range(2):  # solve, drop outliers, solve again
             members = sorted(set(window) | set(fixed))
-            graph, values, sightings = self._build(mp, members, fixed, pids)
+            graph, initial_values, sightings = self._build(slam_map, members, fixed, point_ids)
             map_factors = {}
-            for i, link in map_links.items():
+            for keyframe_id, link in map_links.items():
                 noise = self._map_noise(link)
                 if noise is not None:
-                    map_factors[i] = gtsam.PriorFactorPose3(X(i), gtsam.Pose3(link["T"]), noise)
-                    graph.add(map_factors[i])
-            params = gtsam.LevenbergMarquardtParams()
-            params.setMaxIterations(cfg.iterations)
-            result = gtsam.LevenbergMarquardtOptimizer(graph, values, params).optimize()
-            bad = []
-            for factor, pid, kid, octave in sightings:
-                e = factor.unwhitenedError(result) / self.sigma(octave)
-                if e @ e > cfg.chi2:
-                    bad.append((pid, kid))
-            for pid, kid in bad:
-                mp.forget(pid, kid)
-            removed += len(bad)
-            pids = [p for p in pids if p in mp.points]
+                    map_factors[keyframe_id] = gtsam.PriorFactorPose3(
+                        pose_key(keyframe_id), gtsam.Pose3(link["camera_to_world"]), noise
+                    )
+                    graph.add(map_factors[keyframe_id])
+            parameters = gtsam.LevenbergMarquardtParams()
+            parameters.setMaxIterations(config.iterations)
+            result = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, parameters).optimize()
+            outliers = []
+            for factor, point_id, keyframe_id, pyramid_level in sightings:
+                error = factor.unwhitenedError(result) / self.pixel_sigma(pyramid_level)
+                if error @ error > config.chi2:
+                    outliers.append((point_id, keyframe_id))
+            for point_id, keyframe_id in outliers:
+                slam_map.forget(point_id, keyframe_id)
+            removed_sightings += len(outliers)
+            point_ids = [point_id for point_id in point_ids if point_id in slam_map.points]
             # a map alignment the rest disagrees with (95% limit for 6 numbers) is dropped
-            wrong = [i for i, f in map_factors.items() if 2 * f.error(result) > cfg.link_chi2]
-            for i in wrong:
-                del map_links[i]
-            map_dropped += len(wrong)
-            if not bad and not wrong:
+            rejected = [
+                keyframe_id
+                for keyframe_id, factor in map_factors.items()
+                if 2 * factor.error(result) > config.link_chi2
+            ]
+            for keyframe_id in rejected:
+                del map_links[keyframe_id]
+            dropped_map_links += len(rejected)
+            if not outliers and not rejected:
                 break
 
-        for i in free:
-            mp.keyframes[i].T_wc = result.atPose3(X(i)).matrix()
-        for p in pids:
-            mp.points[p].X = np.asarray(result.atPoint3(L(p))).ravel()
-        link_chi2 = [2 * f.error(result) for f in self._link_factors]  # ~6 if sigma is right
+        for keyframe_id in free:
+            slam_map.keyframes[keyframe_id].camera_to_world = result.atPose3(
+                pose_key(keyframe_id)
+            ).matrix()
+        for point_id in point_ids:
+            slam_map.points[point_id].position = np.asarray(
+                result.atPoint3(point_key(point_id))
+            ).ravel()
+        # weighted error of each dense link: ~6 if dense_link_sigma is right
+        link_chi2 = [2 * factor.error(result) for factor in self._link_factors]
         return {
             "window": len(free),
             "fixed": len(fixed),
-            "points": len(pids),
-            "removed": removed,
+            "points": len(point_ids),
+            "removed": removed_sightings,
             "link_chi2": float(np.mean(link_chi2)) if link_chi2 else float("nan"),
             "map_links": len(map_links),
-            "map_dropped": map_dropped,
-            "ms": (time.perf_counter() - t0) * 1000,
+            "map_dropped": dropped_map_links,
+            "ms": (time.perf_counter() - start_time) * 1000,
         }
 
-    def _build(self, mp: Map, kf_ids: list[int], fixed: list[int], pids: list[int]):
-        graph, values, sightings = gtsam.NonlinearFactorGraph(), gtsam.Values(), []
-        for i in kf_ids:
-            pose = gtsam.Pose3(mp.keyframes[i].T_wc)
-            values.insert(X(i), pose)
-            if i in fixed:
-                graph.add(gtsam.PriorFactorPose3(X(i), pose, FIXED))
-        members = set(kf_ids)
-        for p in pids:
-            point = mp.points[p]
-            values.insert(L(p), point.X)
-            for i, f in point.obs.items():
-                if i not in members:
+    def _build(
+        self, slam_map: Map, keyframe_ids: list[int], fixed: list[int], point_ids: list[int]
+    ):
+        """Factor graph and initial values for the window: sightings, dense links, anchors.
+
+        Returns (graph, initial_values, sightings); sightings are (factor, point id, keyframe
+        id, pyramid level), used afterwards to find and drop outliers.
+        """
+        graph, initial_values, sightings = gtsam.NonlinearFactorGraph(), gtsam.Values(), []
+        for keyframe_id in keyframe_ids:
+            pose = gtsam.Pose3(slam_map.keyframes[keyframe_id].camera_to_world)
+            initial_values.insert(pose_key(keyframe_id), pose)
+            if keyframe_id in fixed:
+                graph.add(gtsam.PriorFactorPose3(pose_key(keyframe_id), pose, FIXED_POSE_NOISE))
+        members = set(keyframe_ids)
+        for point_id in point_ids:
+            point = slam_map.points[point_id]
+            initial_values.insert(point_key(point_id), point.position)
+            for keyframe_id, feature_index in point.sightings.items():
+                if keyframe_id not in members:
                     continue
-                feats = mp.keyframes[i].feats
-                (u, v), d, octave = feats.xy[f], feats.depth[f], int(feats.octave[f])
+                features = slam_map.keyframes[keyframe_id].features
+                u, v = features.pixels[feature_index]
+                depth = features.depth[feature_index]
+                pyramid_level = int(features.pyramid_level[feature_index])
                 factor = gtsam.GenericStereoFactor3D(
-                    gtsam.StereoPoint2(u, u - self.fb / d, v), self._noise(octave), X(i), L(p),
-                    self.cal,
-                )  # fmt: skip
+                    gtsam.StereoPoint2(u, u - self.focal_times_baseline / depth, v),
+                    self._sighting_noise(pyramid_level),
+                    pose_key(keyframe_id),
+                    point_key(point_id),
+                    self.stereo_calibration,
+                )
                 graph.add(factor)
-                sightings.append((factor, p, i, octave))
+                sightings.append((factor, point_id, keyframe_id, pyramid_level))
         self._link_factors = []
-        if self.cfg.dense_links:
-            for (a, b), (Z, info) in mp.links.items():
-                if a in members and b in members and not (a in fixed and b in fixed):
-                    noise = self._link_noise(Z, info)
+        if self.config.dense_links:
+            for (older_id, newer_id), (relative_pose, information) in slam_map.links.items():
+                both_in_window = older_id in members and newer_id in members
+                if both_in_window and not (older_id in fixed and newer_id in fixed):
+                    noise = self._link_noise(relative_pose, information)
                     if noise is not None:
-                        factor = gtsam.BetweenFactorPose3(X(a), X(b), gtsam.Pose3(Z), noise)
+                        factor = gtsam.BetweenFactorPose3(
+                            pose_key(older_id), pose_key(newer_id),
+                            gtsam.Pose3(relative_pose), noise,
+                        )  # fmt: skip
                         graph.add(factor)
                         self._link_factors.append(factor)
-        return graph, values, sightings
+        return graph, initial_values, sightings

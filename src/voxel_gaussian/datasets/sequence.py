@@ -28,6 +28,24 @@ class RGBDSequence:
     depth_scale: float  # metres = stored value / depth_scale
     distortion: np.ndarray  # OpenCV (k1, k2, p1, p2, k3); all 0 = already undistorted
     _maps: tuple | None = field(default=None, repr=False)
+    raw_intrinsics: Intrinsics | None = field(default=None, repr=False)  # the lens's own
+
+    def __post_init__(self):
+        """With lens distortion, frames are undistorted onto a slightly zoomed-in camera
+        chosen so that every output pixel holds image data: undistorting onto the lens's own
+        camera leaves black curved corners (6% of a TUM frame) that no model can match and
+        that weigh heavily in PSNR. `intrinsics` then describes that new camera (same image
+        size, larger focal length, shifted centre); `raw_intrinsics` keeps the lens's own."""
+        if not np.any(self.distortion):
+            return
+        raw = self.intrinsics
+        size = (raw.width, raw.height)
+        K_new, _ = cv2.getOptimalNewCameraMatrix(raw.matrix(), self.distortion, size, alpha=0)
+        self.raw_intrinsics = raw
+        self.intrinsics = Intrinsics(
+            float(K_new[0, 0]), float(K_new[1, 1]), float(K_new[0, 2]), float(K_new[1, 2]),
+            raw.width, raw.height,
+        )  # fmt: skip
 
     def __len__(self) -> int:
         return len(self.color_paths)
@@ -48,15 +66,17 @@ class RGBDSequence:
         )
 
     def _undistort(self, color, depth):
-        """Remove lens distortion. TUM depth is registered to the colour camera, so both
-        images use the same maps. Depth uses nearest-neighbour: blending depths across an
-        object edge would invent surfaces that don't exist."""
+        """Remove lens distortion, onto the camera `intrinsics` (no black corners, see
+        __post_init__). TUM depth is registered to the colour camera, so both images use the
+        same maps. Depth uses nearest-neighbour: blending depths across an object edge would
+        invent surfaces that don't exist."""
         if self._maps is None:
-            K = self.intrinsics.matrix()
-            size = (self.intrinsics.width, self.intrinsics.height)
+            raw = self.raw_intrinsics
+            size = (raw.width, raw.height)
             self._maps = cv2.initUndistortRectifyMap(
-                K, self.distortion, None, K, size, cv2.CV_32FC1
-            )
+                raw.matrix(), self.distortion, None, self.intrinsics.matrix(), size,
+                cv2.CV_32FC1,
+            )  # fmt: skip
         m1, m2 = self._maps
         color = cv2.remap(color, m1, m2, cv2.INTER_LINEAR)
         depth = cv2.remap(depth, m1, m2, cv2.INTER_NEAREST)

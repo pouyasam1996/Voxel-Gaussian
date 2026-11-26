@@ -27,9 +27,11 @@ from voxel_gaussian.tsdf.volume import TSDFVolume
 
 
 class Mapper:
-    def __init__(self, K: Intrinsics, tsdf: TSDFConfig, cfg: MapConfig, device):
-        self.K, self.cfg, self.min_weight = K, cfg, tsdf.min_weight
-        self.vol = TSDFVolume(tsdf.voxel, tsdf.block, tsdf.trunc_voxels, tsdf.depth_max, device)
+    """Voxel map of the settled keyframes: fuses them, re-fuses moved ones, aligns new ones."""
+
+    def __init__(self, intrinsics: Intrinsics, tsdf: TSDFConfig, config: MapConfig, device):
+        self.intrinsics, self.config, self.min_weight = intrinsics, config, tsdf.min_weight
+        self.volume = TSDFVolume(tsdf.voxel, tsdf.block, tsdf.trunc_voxels, tsdf.depth_max, device)
         self.fused_pose: dict[int, np.ndarray] = {}  # keyframe id -> pose it was fused with
         self.blocks: dict[int, np.ndarray] = {}  # keyframe id -> block codes it touched
         self.block_index: dict[int, list[int]] = {}  # block code -> keyframes that touched it
@@ -41,67 +43,79 @@ class Mapper:
 
     # ------------------------------------------------------------------ fusion
 
-    def _fuse(self, kf: Keyframe, T_wc: np.ndarray, remove: bool = False) -> np.ndarray:
-        t0 = time.perf_counter()
-        color = kf.color.astype(np.float32) / 255.0
-        codes = self.vol.integrate(kf.depth, color, T_wc, self.K, remove=remove)
-        self.stats["fuse_ms"].append((time.perf_counter() - t0) * 1000)
-        return codes
+    def _fuse(
+        self, keyframe: Keyframe, camera_to_world: np.ndarray, remove: bool = False
+    ) -> np.ndarray:
+        """Fuse keyframe's RGB-D into the volume at a pose (or remove it); returns its blocks."""
+        start_time = time.perf_counter()
+        color = keyframe.color.astype(np.float32) / 255.0
+        block_codes = self.volume.integrate(
+            keyframe.depth, color, camera_to_world, self.intrinsics, remove=remove
+        )
+        self.stats["fuse_ms"].append((time.perf_counter() - start_time) * 1000)
+        return block_codes
 
-    def update(self, mp: Map, newest: int) -> None:
+    def update(self, slam_map: Map, newest_keyframe_id: int) -> None:
         """After each keyframe: re-fuse settled keyframes that moved, fuse newly settled ones."""
-        cfg = self.cfg
-        for i, T_old in list(self.fused_pose.items()):
-            kf = mp.keyframes[i]
-            dist, angle = pose_change(T_old, kf.T_wc)
-            if dist > cfg.refuse_translation or angle > cfg.refuse_rotation_deg:
-                self._fuse(kf, T_old, remove=True)
-                self._fuse(kf, kf.T_wc)
-                self.fused_pose[i] = kf.T_wc.copy()
+        config = self.config
+        for keyframe_id, fused_with in list(self.fused_pose.items()):
+            keyframe = slam_map.keyframes[keyframe_id]
+            distance, angle = pose_change(fused_with, keyframe.camera_to_world)
+            if distance > config.refuse_translation or angle > config.refuse_rotation_deg:
+                self._fuse(keyframe, fused_with, remove=True)
+                self._fuse(keyframe, keyframe.camera_to_world)
+                self.fused_pose[keyframe_id] = keyframe.camera_to_world.copy()
                 self.stats["refused"] += 1
-        for kf in mp.keyframes[: max(0, newest - cfg.settle_after + 1)]:
-            if kf.id in self.fused_pose:
+        settled_count = max(0, newest_keyframe_id - config.settle_after + 1)
+        for keyframe in slam_map.keyframes[:settled_count]:
+            if keyframe.id in self.fused_pose:
                 continue
-            codes = self._fuse(kf, kf.T_wc)
-            self.fused_pose[kf.id] = kf.T_wc.copy()
-            self.blocks[kf.id] = codes
-            for code in codes.tolist():
-                self.block_index.setdefault(code, []).append(kf.id)
+            block_codes = self._fuse(keyframe, keyframe.camera_to_world)
+            self.fused_pose[keyframe.id] = keyframe.camera_to_world.copy()
+            self.blocks[keyframe.id] = block_codes
+            for block_code in block_codes.tolist():
+                self.block_index.setdefault(block_code, []).append(keyframe.id)
             self.stats["fused"] += 1
 
-    def finish(self, mp: Map) -> None:
+    def finish(self, slam_map: Map) -> None:
         """End of the run: everything has settled."""
-        self.update(mp, len(mp.keyframes) + self.cfg.settle_after)
+        self.update(slam_map, len(slam_map.keyframes) + self.config.settle_after)
 
     # ------------------------------------------------------------------ alignment
 
-    def scan(self, kf: Keyframe) -> np.ndarray:
+    def scan(self, keyframe: Keyframe) -> np.ndarray:
         """About `icp_points` depth points of the keyframe, evenly spread, camera frame."""
-        depth = kf.depth
-        ok = (depth > 0) & (depth < self.vol.depth_max)
-        idx = np.flatnonzero(ok.ravel())
-        idx = idx[:: max(1, len(idx) // self.cfg.icp_points)]
-        v, u = np.divmod(idx, depth.shape[1])
-        return self.K.backproject(u.astype(float), v.astype(float), depth.ravel()[idx])
+        depth = keyframe.depth
+        valid = (depth > 0) & (depth < self.volume.depth_max)
+        pixel_indices = np.flatnonzero(valid.ravel())
+        pixel_indices = pixel_indices[:: max(1, len(pixel_indices) // self.config.icp_points)]
+        rows, columns = np.divmod(pixel_indices, depth.shape[1])
+        return self.intrinsics.backproject(
+            columns.astype(float), rows.astype(float), depth.ravel()[pixel_indices]
+        )
 
-    def align(self, kf: Keyframe) -> dict | None:
-        """Align kf to the settled map. Accepted only if enough of it lands on mapped surface
-        and the correction is small (drift-sized); then it becomes a link in bundle adjustment."""
-        cfg = self.cfg
-        if len(self.vol.codes) == 0:
+    def align(self, keyframe: Keyframe) -> dict | None:
+        """Align keyframe to the settled map. Accepted only if enough of it lands on mapped
+        surface and the correction is small (drift-sized); then it becomes a link in bundle
+        adjustment."""
+        config = self.config
+        if len(self.volume.codes) == 0:
             return None
-        icp = self.stats["icp"]
-        icp["tried"] += 1
-        res = align(self.vol, self.scan(kf), kf.T_wc, cfg.icp_iters, cfg.icp_huber, self.min_weight)
-        if res is None or res["overlap"] < cfg.icp_min_overlap:
-            icp["low_overlap"] += 1
+        icp_counts = self.stats["icp"]
+        icp_counts["tried"] += 1
+        alignment = align(
+            self.volume, self.scan(keyframe), keyframe.camera_to_world,
+            config.icp_iters, config.icp_huber, self.min_weight,
+        )  # fmt: skip
+        if alignment is None or alignment["overlap"] < config.icp_min_overlap:
+            icp_counts["low_overlap"] += 1
             return None
-        dist, angle = pose_change(kf.T_wc, res["T"])
-        if dist > cfg.icp_max_correction or angle > cfg.icp_max_correction_deg:
-            icp["too_large"] += 1
+        distance, angle = pose_change(keyframe.camera_to_world, alignment["camera_to_world"])
+        if distance > config.icp_max_correction or angle > config.icp_max_correction_deg:
+            icp_counts["too_large"] += 1
             return None
-        icp["accepted"] += 1
-        self.icp_correction_cm.append(dist * 100)
-        self.icp_rms_mm.append(res["rms"] * 1000)
-        res["sigma"] = cfg.icp_link_sigma
-        return res
+        icp_counts["accepted"] += 1
+        self.icp_correction_cm.append(distance * 100)
+        self.icp_rms_mm.append(alignment["rms"] * 1000)
+        alignment["sigma"] = config.icp_link_sigma
+        return alignment

@@ -134,19 +134,24 @@ class TSDFVolume:
 
     @torch.no_grad()
     def integrate(
-        self, depth, color, T_wc: np.ndarray, K: Intrinsics, remove: bool = False
-    ) -> np.ndarray:
+        self, depth, color, T_wc: np.ndarray, K: Intrinsics, remove: bool = False,
+        only_blocks: torch.Tensor | None = None,
+    ) -> np.ndarray:  # fmt: skip
         """Fuse one frame (or remove it again): depth (H, W) in metres, colour (H, W, 3) in
         [0, 1], camera -> world pose T_wc. Returns the codes of the blocks it touched.
 
         Removing undoes the running average exactly: value = (w * value - new) / (w - 1),
         weight -= 1 (a voxel back at weight 0 is empty again). It needs the same images and
         the same pose that were used to add the frame.
+        only_blocks: sorted block codes; blocks outside them are never created or updated
+        (the fine level of tsdf/adaptive.py).
         """
         depth = torch.as_tensor(depth, dtype=torch.float32, device=self.device)
         color = torch.as_tensor(color, dtype=torch.float32, device=self.device)
         R, t = world_to_camera(T_wc, self.device)
         keys = self.touched_blocks(depth, R, t, K)
+        if only_blocks is not None:
+            keys = keys[find(only_blocks, encode(keys))[1]]
         idx = self._allocate(keys)
         b3 = self.block**3
 

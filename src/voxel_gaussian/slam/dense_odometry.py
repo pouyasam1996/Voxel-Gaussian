@@ -14,7 +14,7 @@ tensor version's CPU image kernels (colour -> grey, bilateral filter) are not bu
 fails on every frame. The legacy version runs the same hybrid method on any CPU.
 
 Returned motion: the current camera's pose in the previous camera's frame, so
-    T_wc[k] = T_wc[k-1] @ motion.
+    camera_to_world[k] = camera_to_world[k-1] @ motion.
 """
 
 import numpy as np
@@ -31,21 +31,26 @@ JACOBIANS = {
 
 
 class DenseOdometry:
-    def __init__(self, K: Intrinsics, cfg: DenseOdometryConfig, depth_max: float):
-        self.K = o3d.camera.PinholeCameraIntrinsic(K.width, K.height, K.fx, K.fy, K.cx, K.cy)
-        self.jacobian = JACOBIANS[cfg.method]()
+    """Dense RGB-D alignment (Open3D): keyframe links, dense fallback tracking, baseline odometry."""
+
+    def __init__(self, intrinsics: Intrinsics, config: DenseOdometryConfig, depth_max: float):
+        self.intrinsics = o3d.camera.PinholeCameraIntrinsic(
+            intrinsics.width, intrinsics.height,
+            intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
+        )  # fmt: skip
+        self.jacobian = JACOBIANS[config.method]()
         self.option = odometry.OdometryOption(
-            o3d.utility.IntVector(cfg.iterations), cfg.depth_outlier_trunc, 0.0, depth_max
+            o3d.utility.IntVector(config.iterations), config.depth_outlier_trunc, 0.0, depth_max
         )
         self.depth_max = depth_max
-        self.depth_outlier_trunc = cfg.depth_outlier_trunc
-        self.prev = None
+        self.depth_outlier_trunc = config.depth_outlier_trunc
+        self.previous_image = None
 
-    def align(self, source, target, init=None, iterations: list[int] | None = None):
+    def align(self, source, target, initial_motion=None, iterations: list[int] | None = None):
         """Align two RGB-D images (from rgbd()): source camera's pose in the target's frame.
 
-        Returns (ok, 4x4 motion, 6x6 information matrix). The information matrix says which
-        directions the alignment pinned down: Open3D sums, over all matched pixels, the
+        Returns (success, 4x4 motion, 6x6 information matrix). The information matrix says
+        which directions the alignment pinned down: Open3D sums, over all matched pixels, the
         squared effect of each of the 6 motion numbers on the target point (rotation first,
         then translation, perturbed in the target camera's frame).
         """
@@ -54,14 +59,14 @@ class DenseOdometry:
             option = odometry.OdometryOption(
                 o3d.utility.IntVector(iterations), self.depth_outlier_trunc, 0.0, self.depth_max
             )
-        init = np.eye(4) if init is None else init
-        ok, motion, info = odometry.compute_rgbd_odometry(
-            source, target, self.K, init, self.jacobian, option
+        initial_motion = np.eye(4) if initial_motion is None else initial_motion
+        success, motion, information = odometry.compute_rgbd_odometry(
+            source, target, self.intrinsics, initial_motion, self.jacobian, option
         )
-        return ok, np.asarray(motion), np.asarray(info)
+        return success, np.asarray(motion), np.asarray(information)
 
     def rgbd(self, color: np.ndarray, depth: np.ndarray) -> o3d.geometry.RGBDImage:
-        # Colour becomes brightness in [0, 1]; depth is already in metres (depth_scale = 1).
+        """Open3D RGB-D image for align(): colour -> brightness in [0, 1], depth in metres."""
         return o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(np.ascontiguousarray(color)),
             o3d.geometry.Image(np.ascontiguousarray(depth, dtype=np.float32)),
@@ -72,13 +77,13 @@ class DenseOdometry:
 
     def track(self, color: np.ndarray, depth: np.ndarray):
         """Motion since the previous frame (4x4), or None if alignment failed; plus info."""
-        cur = self.rgbd(color, depth)
-        prev, self.prev = self.prev, cur
-        if prev is None:
+        current_image = self.rgbd(color, depth)
+        previous_image, self.previous_image = self.previous_image, current_image
+        if previous_image is None:
             return np.eye(4), {}
-        ok, motion, _ = odometry.compute_rgbd_odometry(
-            cur, prev, self.K, np.eye(4), self.jacobian, self.option
+        success, motion, _ = odometry.compute_rgbd_odometry(
+            current_image, previous_image, self.intrinsics, np.eye(4), self.jacobian, self.option
         )
-        if not ok:  # e.g. too few valid pixel pairs
+        if not success:  # e.g. too few valid pixel pairs
             return None, {"error": "alignment failed"}
         return np.asarray(motion), {}
