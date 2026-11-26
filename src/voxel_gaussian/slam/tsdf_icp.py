@@ -27,47 +27,52 @@ from voxel_gaussian.tsdf.volume import TSDFVolume
 
 
 def align(
-    vol: TSDFVolume,
-    points_cam: np.ndarray,
-    T_wc: np.ndarray,
-    iters: int,
+    volume: TSDFVolume,
+    camera_points: np.ndarray,
+    camera_to_world: np.ndarray,
+    iterations: int,
     huber: float,
     min_weight: float,
 ) -> dict | None:
     """Pose of the scan (camera -> world) aligned to the map, plus fit numbers; None if the
-    scan hardly touches mapped surface."""
-    Pc = torch.as_tensor(points_cam, dtype=torch.float32, device=vol.device)
-    T = T_wc.copy()
+    scan hardly touches mapped surface.
+
+    Result keys: camera_to_world, information (6x6), pivot (the scan's centre the turn is
+    about), overlap, rms, points."""
+    scan = torch.as_tensor(camera_points, dtype=torch.float32, device=volume.device)
+    pose = camera_to_world.copy()
     overlap = None
-    for it in range(iters + 1):
-        R = torch.as_tensor(T[:3, :3], dtype=torch.float32, device=vol.device)
-        t = torch.as_tensor(T[:3, 3], dtype=torch.float32, device=vol.device)
-        gap, normal, ok = sample(vol, Pc @ R.T + t, min_weight)
+    for iteration in range(iterations + 1):
+        rotation = torch.as_tensor(pose[:3, :3], dtype=torch.float32, device=volume.device)
+        translation = torch.as_tensor(pose[:3, 3], dtype=torch.float32, device=volume.device)
+        gap, normal, on_surface = sample(volume, scan @ rotation.T + translation, min_weight)
         if overlap is None:
-            overlap = float(ok.float().mean())
-        if int(ok.sum()) < 50:
+            overlap = float(on_surface.float().mean())
+        if int(on_surface.sum()) < 50:
             return None
-        p = (Pc[ok] @ R.T + t).cpu().double().numpy()
-        n = normal[ok].cpu().double().numpy()
-        r = gap[ok].cpu().double().numpy()
-        c = p.mean(axis=0)
-        J = np.hstack([np.cross(p - c, n), n])
-        w = np.where(np.abs(r) <= huber, 1.0, huber / np.maximum(np.abs(r), 1e-12))
-        H = (J * w[:, None]).T @ J
-        if it == iters:  # last pass only measures the fit at the final pose
+        world_points = (scan[on_surface] @ rotation.T + translation).cpu().double().numpy()
+        normals = normal[on_surface].cpu().double().numpy()
+        gaps = gap[on_surface].cpu().double().numpy()
+        centre = world_points.mean(axis=0)
+        jacobian = np.hstack([np.cross(world_points - centre, normals), normals])
+        huber_weights = np.where(
+            np.abs(gaps) <= huber, 1.0, huber / np.maximum(np.abs(gaps), 1e-12)
+        )
+        information = (jacobian * huber_weights[:, None]).T @ jacobian
+        if iteration == iterations:  # last pass only measures the fit at the final pose
             break
-        g = (J * w[:, None]).T @ r
-        x = -np.linalg.solve(H + 1e-9 * np.trace(H) * np.eye(6), g)
-        dR = cv2.Rodrigues(x[:3])[0]
-        T_new = np.eye(4)
-        T_new[:3, :3] = dR @ T[:3, :3]
-        T_new[:3, 3] = dR @ (T[:3, 3] - c) + c + x[3:]
-        T = T_new
+        gradient = (jacobian * huber_weights[:, None]).T @ gaps
+        step = -np.linalg.solve(information + 1e-9 * np.trace(information) * np.eye(6), gradient)
+        step_rotation = cv2.Rodrigues(step[:3])[0]
+        new_pose = np.eye(4)
+        new_pose[:3, :3] = step_rotation @ pose[:3, :3]
+        new_pose[:3, 3] = step_rotation @ (pose[:3, 3] - centre) + centre + step[3:]
+        pose = new_pose
     return {
-        "T": T,
-        "info": H,  # perturbation: turn around `pivot`, then shift, in world axes
-        "pivot": c,
+        "camera_to_world": pose,
+        "information": information,  # perturbation: turn around `pivot`, shift, world axes
+        "pivot": centre,
         "overlap": overlap,
-        "rms": float(np.sqrt(np.mean(r**2))),
-        "points": len(r),
+        "rms": float(np.sqrt(np.mean(gaps**2))),
+        "points": len(gaps),
     }

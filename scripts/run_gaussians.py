@@ -331,7 +331,7 @@ def realign(volume: TSDFVolume, cams: list[Camera]) -> list[Camera]:
         v, u = np.divmod(idx, depth.shape[1])
         pts = K.backproject(u.astype(float), v.astype(float), depth.ravel()[idx])
         res = align(volume, pts, cam.pose(), s.realign_iters, s.realign_huber, cfg.tsdf.min_weight)
-        out.append(cam if res is None else Camera.from_pose(K, res["T"], device))
+        out.append(cam if res is None else Camera.from_pose(K, res["camera_to_world"], device))
     return out
 
 

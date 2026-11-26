@@ -67,7 +67,7 @@ for k, i in enumerate(frames):
             f"  frame {k}/{len(frames)}: {len(tracker.map.keyframes)} keyframes, "
             f"{len(tracker.map.points)} points, {lost} lost, "
             f"{np.median(frame_ms or [np.nan]):.1f} ms/frame, "
-            f"{np.median(tracker.kf_ms):.0f} ms/keyframe"
+            f"{np.median(tracker.keyframe_ms):.0f} ms/keyframe"
         )
 
 tracker.finish()  # fuse the keyframes still being optimized at the end
@@ -78,7 +78,7 @@ save_tum(run_dir / "keyframes.txt", stamps[kf_frames], kf_poses)
 a, r, a_kf = ate(est, gt), rpe(est, gt), ate(kf_poses, gt[kf_frames])
 
 statuses = Counter(f.status for f in tracker.frames)
-ba = [b for b in tracker.ba_stats if b]
+ba = [b for b in tracker.bundle_adjustment_stats if b]
 result = {
     "frames": len(frames),
     "keyframes": len(kf_frames),
@@ -91,7 +91,7 @@ result = {
     "rpe_trans_cm": r["trans_rmse_cm"],
     "rpe_rot_deg": r["rot_rmse_deg"],
     "frame_ms_median": float(np.median(frame_ms)) if frame_ms else float("nan"),
-    "keyframe_ms_median": float(np.median(tracker.kf_ms)),
+    "keyframe_ms_median": float(np.median(tracker.keyframe_ms)),
     "dense_links_ok_failed": list(tracker.dense_links),
 }
 if s.ba.enabled and s.reuse.enabled:  # coming back to mapped areas
@@ -116,7 +116,7 @@ if ba:
 
 if tracker.mapper is not None:
     mapper, t = tracker.mapper, cfg.tsdf
-    pts, cols, normals = extract_points(mapper.vol, t.min_weight)
+    pts, cols, normals = extract_points(mapper.volume, t.min_weight)
     save_ply(run_dir / "surface.ply", pts, cols, normals)
     # Reference: the same keyframe images fused with their TRUE poses. Comparing with it
     # measures only what pose errors do to the surface (same images, same voxel size).
@@ -129,7 +129,7 @@ if tracker.mapper is not None:
     # (this run's frame list) index `poses`; frames[k] is the dataset frame number.
     torch.save(
         {
-            "tsdf": mapper.vol.state(),
+            "tsdf": mapper.volume.state(),
             "frames": list(frames),
             "poses": torch.from_numpy(est),
             "keyframes": list(kf_frames),
@@ -143,7 +143,7 @@ if tracker.mapper is not None:
     icp = mapper.stats["icp"]
     result["map"] = {
         **surface,
-        "memory_mb": mapper.vol.memory_mb(),
+        "memory_mb": mapper.volume.memory_mb(),
         "fused": mapper.stats["fused"],
         "refused_after_move": mapper.stats["refused"],
         "fuse_ms_median": float(np.median(mapper.stats["fuse_ms"])),
