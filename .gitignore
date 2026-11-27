@@ -43,6 +43,9 @@ runs/
 *.ply
 *.splat
 
+# --- Documents (local notes, Word lock files ~$*.docx included) ---
+*.docx
+
 # --- OS and editors ---
 .DS_Store
 .idea/
